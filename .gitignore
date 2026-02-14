@@ -26,6 +26,10 @@ output/
 # Hunyuan submodule (tracked separately or too large)
 Hunyuan3D-2.1/
 
+# Large binaries
+textured_models/
+textured_models.zip
+
 # OS
 Thumbs.db
 Desktop.ini

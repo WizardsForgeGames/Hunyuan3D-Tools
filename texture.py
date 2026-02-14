@@ -11,6 +11,8 @@ import os
 import sys
 import time
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Resolve paths relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
@@ -42,6 +44,10 @@ def main():
                              "'sparse' uses 2:4 Sparse INT8 Tensor Cores (75%% weight VRAM savings), "
                              "'tensorcore' uses custom Int8Linear (50%% weight VRAM savings), "
                              "'bnb' uses bitsandbytes, 'none' disables quantization.")
+    parser.add_argument("--steps", type=int, default=15,
+                        help="Denoising steps (default: 15, try 10 for speed)")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the UNet for faster denoising (adds ~60s first-run warmup)")
     # Legacy alias
     parser.add_argument("--no-quantize", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -82,6 +88,7 @@ def main():
     from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
     conf = Hunyuan3DPaintConfig(args.views, args.resolution)
+    conf.num_inference_steps = args.steps
     conf.realesrgan_ckpt_path = os.path.join(REPO_DIR, "hy3dpaint/ckpt/RealESRGAN_x4plus.pth")
     conf.multiview_cfg_path = os.path.join(REPO_DIR, "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml")
     conf.custom_pipeline = os.path.join(REPO_DIR, "hy3dpaint/hunyuanpaintpbr")
@@ -117,6 +124,15 @@ def main():
             if hasattr(mv_model, "dino_v2"):
                 print("Quantizing DINOv2 (bitsandbytes)...")
                 quantize_model_int8(mv_model.dino_v2)
+
+    # torch.compile the UNet for faster denoising via CUDA graphs
+    if args.compile:
+        import torch
+        mv_model = paint_pipeline.models["multiview_model"]
+        print("Compiling UNet (first run will be slower)...")
+        mv_model.pipeline.unet = torch.compile(
+            mv_model.pipeline.unet, mode="reduce-overhead"
+        )
 
     print("Generating textures...")
     paint_pipeline(

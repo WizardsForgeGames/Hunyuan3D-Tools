@@ -17,7 +17,9 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
-VENV_PYTHON = os.path.join(SCRIPT_DIR, "venv", "Scripts", "python.exe")
+# Use venv Python if it exists, otherwise fall back to current interpreter
+_venv_python = os.path.join(SCRIPT_DIR, "venv", "Scripts", "python.exe")
+VENV_PYTHON = _venv_python if os.path.isfile(_venv_python) else sys.executable
 
 
 def main():

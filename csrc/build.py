@@ -25,11 +25,33 @@ _CACHED_TC_MODULE = None
 _CACHED_SPARSE_MODULE = None
 _CACHED_SPARSE_TC_MODULE = None
 
-# MSVC path for Windows builds
-_MSVC_PATH = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.37.32822"
+# MSVC path for Windows builds (auto-detected or set via MSVC_PATH env var)
+_MSVC_PATH = os.environ.get("MSVC_PATH", "")
 
 # cuSPARSELt paths (pip install nvidia-cusparselt-cu12)
 _CUSPARSELT_BASE = None
+
+
+def _find_msvc():
+    """Auto-detect MSVC install on Windows."""
+    if _MSVC_PATH and os.path.isdir(_MSVC_PATH):
+        return _MSVC_PATH
+    # Search common VS install locations
+    for vs_base in [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "Microsoft Visual Studio"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     "Microsoft Visual Studio"),
+    ]:
+        for edition in ["2022", "2019"]:
+            for sku in ["Community", "Professional", "Enterprise", "BuildTools"]:
+                msvc_root = os.path.join(vs_base, edition, sku, "VC", "Tools", "MSVC")
+                if os.path.isdir(msvc_root):
+                    # Pick the latest version
+                    versions = sorted(os.listdir(msvc_root), reverse=True)
+                    if versions:
+                        return os.path.join(msvc_root, versions[0])
+    return ""
 
 
 def _get_cuda_flags():
@@ -44,13 +66,15 @@ def _get_cuda_flags():
     ]
 
     if os.name == "nt":
-        cl_dir = os.path.join(_MSVC_PATH, "bin", "Hostx64", "x64")
-        if os.path.isdir(cl_dir) and cl_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = cl_dir + os.pathsep + os.environ.get("PATH", "")
+        msvc_path = _find_msvc()
+        if msvc_path:
+            cl_dir = os.path.join(msvc_path, "bin", "Hostx64", "x64")
+            if os.path.isdir(cl_dir) and cl_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = cl_dir + os.pathsep + os.environ.get("PATH", "")
 
-        cl_exe = os.path.join(_MSVC_PATH, "bin", "Hostx64", "x64", "cl.exe")
-        if os.path.isfile(cl_exe):
-            extra_cuda_cflags.append(f"-ccbin={cl_exe}")
+            cl_exe = os.path.join(cl_dir, "cl.exe")
+            if os.path.isfile(cl_exe):
+                extra_cuda_cflags.append(f"-ccbin={cl_exe}")
 
     return extra_cflags, extra_cuda_cflags
 
@@ -123,8 +147,16 @@ def _find_cusparselt():
     except importlib.metadata.PackageNotFoundError:
         pass
 
-    # Try common manual install locations
-    for path in [r"C:\libs\cusparselt", r"G:\libs\cusparselt"]:
+    # Try CUSPARSELT_PATH env var or common install locations
+    search_paths = []
+    env_path = os.environ.get("CUSPARSELT_PATH", "")
+    if env_path:
+        search_paths.append(env_path)
+    # Check under CUDA toolkit
+    cuda_home = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME", "")
+    if cuda_home:
+        search_paths.append(cuda_home)
+    for path in search_paths:
         if os.path.isfile(os.path.join(path, "include", "cusparseLt.h")):
             _CUSPARSELT_BASE = path
             return path
