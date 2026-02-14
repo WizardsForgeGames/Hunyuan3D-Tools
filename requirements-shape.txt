@@ -1,0 +1,44 @@
+# Shape-only requirements for Hunyuan3D-2.1
+# (PyTorch installed separately with CUDA support)
+
+# Build tools
+ninja==1.11.1.1
+pybind11==2.13.4
+
+# Core ML
+transformers==4.46.0
+diffusers==0.30.0
+accelerate==1.1.1
+huggingface-hub==0.30.2
+safetensors==0.4.4
+
+# Scientific computing
+numpy==1.24.4
+scipy==1.14.1
+einops==0.8.0
+
+# Image processing
+opencv-python==4.10.0.84
+imageio==2.36.0
+Pillow
+rembg==2.0.65
+onnxruntime==1.16.3
+
+# 3D mesh processing
+trimesh==4.4.7
+pymeshlab==2022.2.post3
+pygltflib==1.16.3
+xatlas==0.0.9
+
+# Config
+omegaconf==2.3.0
+pyyaml==6.0.2
+
+# Utilities
+tqdm==4.66.5
+
+# DiffEq (used by shape pipeline scheduler)
+torchdiffeq
+
+# Image models
+timm
