@@ -171,11 +171,13 @@ def main():
         (320, 320),
         (640, 640),
         (1280, 1280),
-        (1280, 5120),    # FFN up-projection
-        (5120, 1280),    # FFN down-projection
+        (1280, 5120),    # representative 4x FFN up-projection (the paint UNet's GEGLU uses 1280->10240)
+        (5120, 1280),    # representative 4x FFN down-projection
         (1024, 1024),    # cross-attention
-        (1536, 6144),    # DINOv2 FFN
-        (6144, 1536),    # DINOv2 FFN
+        (1536, 6144),    # representative 4x FFN at width 1536
+        (6144, 1536),    # representative 4x FFN down at width 1536
+        (1536, 8192),    # dinov2-giant SwiGLU w12 (gate + up)
+        (4096, 1536),    # dinov2-giant SwiGLU w3 (down)
     ]
 
     if args.shapes:
