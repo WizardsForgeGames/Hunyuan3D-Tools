@@ -5,9 +5,10 @@ Four compute backends (auto-selected per layer):
   1. "sparse" — 2:4 Sparse INT8 Tensor Core GEMM via PTX mma.sp.
      Prunes 50% of weights (2:4 pattern), compresses, and uses Sparse
      Tensor Cores. Requires K % 64 == 0, N % 16 == 0. Measured: 69% weight
-     memory reduction per layer vs FP16 (incl. metadata/scales) and
-     1.3-1.5x vs cuBLAS FP16 on large layers at M >= 4096. Dense INT8
-     (cuBLASLt) is faster in raw GEMM throughput.
+     memory reduction per layer vs FP16 (incl. metadata/scales). Kernel is
+     sparsemma's optimized one; on the paint pipeline's sparse-mode shapes it
+     runs 1.1-2.9x faster than cuBLAS FP16 per layer (GPU time, RTX 4090),
+     except narrow N=320 at very large M (tools/benchmark.py --hunyuan).
 
   2. "tc" — Custom INT8 Tensor Core GEMM via wmma intrinsics. Fuses
      GEMM + dequant + bias in one kernel. Beats FP16 on wide layers
@@ -123,7 +124,7 @@ class Int8Linear(nn.Module):
 
     Four compute paths (auto-selected):
       1. sparse: 2:4 Sparse INT8 TC GEMM via PTX mma.sp (fused quant+GEMM+dequant+bias).
-         Requires K % 32 == 0, N % 16 == 0. Uses from_linear_sparse().
+         Requires K % 64 == 0, N % 16 == 0. Uses from_linear_sparse().
       2. TC: Dense INT8 Tensor Core GEMM (fused quant+GEMM+dequant+bias).
          Requires K % 64 == 0, N % 16 == 0.
       3. dequant: Dequantize int8->fp16 on-the-fly + fp16 matmul. Fallback.
@@ -407,7 +408,8 @@ def quantize_model_sparse(model, min_features=128, sparse_min_k=640, verbose=Tru
         min_features: Only quantize layers where both in/out >= this value.
         sparse_min_k: Minimum in_features (K dimension) for sparse quantization.
             Layers with in_features < sparse_min_k stay as FP16. Default 640.
-            Benchmarked on RTX 4090: k>=640 gives ~1.01x FP16 speed with 405 MB savings.
+            Chosen with the previous sparse kernel (k>=640 gave ~1.01x FP16 speed on an
+            RTX 4090); not re-tuned for the current kernel.
         verbose: Print summary of what was quantized.
 
     Returns:
@@ -424,11 +426,13 @@ def quantize_model_sparse(model, min_features=128, sparse_min_k=640, verbose=Tru
 
     if verbose:
         fp16_mb = stats["quantized_params"] * 2 / 1e6
-        sparse_mb = stats["quantized_params"] * 0.5625 / 1e6  # K/2 + K/32*4 bytes per row = 9/16 of dense int8
+        # 0.5 B/weight int8 values (K/2 per row) + 0.125 B/weight metadata (K/32 int32 per row)
+        sparse_mb = stats["quantized_params"] * 0.625 / 1e6
         saved_mb = fp16_mb - sparse_mb
         print(f"  Quantized {stats['num_replaced']} Linear layers -> sparse Int8Linear [2:4 Sparse TC]")
         print(f"  Sparse-eligible: {stats['sparse_eligible']} layers")
-        print(f"  Kept as FP16: {stats['kept_fp16']} layers (K < {sparse_min_k})")
+        print(f"  Kept as FP16: {stats['kept_fp16']} layers "
+              f"(K < {sparse_min_k}, K % 64 != 0, or N % 16 != 0)")
         print(f"  Linear params: {stats['total_params'] / 1e6:.1f}M total, "
               f"{stats['quantized_params'] / 1e6:.1f}M quantized, "
               f"{stats['skipped_params'] / 1e6:.1f}M skipped (below {min_features} features)")
@@ -446,8 +450,13 @@ def _replace_linear_sparse(module, min_features, sparse_min_k, stats):
 
             if child.in_features < min_features or child.out_features < min_features:
                 stats["skipped_params"] += num_params
-            elif child.in_features < sparse_min_k:
-                # K too small for sparse kernel to beat FP16 — keep as nn.Linear
+            elif (child.in_features < sparse_min_k
+                  or child.in_features % 64 != 0
+                  or child.out_features % 16 != 0):
+                # K too small for the sparse kernel to beat FP16, or a shape the kernel
+                # cannot run (needs K % 64 == 0, N % 16 == 0). A sparse Int8Linear with an
+                # unsupported shape would fall through to the dequant path, which has no
+                # dense weights in sparse mode, so keep these layers as nn.Linear.
                 stats["kept_fp16"] = stats.get("kept_fp16", 0) + 1
             else:
                 int8_layer = Int8Linear.from_linear_sparse(child)

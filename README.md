@@ -135,7 +135,10 @@ Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15)
 Custom CUDA kernels replace all Linear layers in the multiview UNet and DINOv2:
 
 - **Tensorcore mode**: Custom wmma INT8 GEMM kernel. Fuses GEMM + dequant + bias. ~1.0-1.3x FP16 speed. 50% less weight memory than FP16 (one INT8 N×K copy plus per-channel scales; measured with `tools/test_int8_memory.py`). Sparse mode cuts it by 69%.
-- **Sparse mode**: 2:4 structured sparsity + Sparse Tensor Cores via PTX `mma.sp`. Measured: 69% weight-memory reduction per layer vs FP16 and 1.3-1.5x vs cuBLAS FP16 on the large FFN layers at M >= 4096 (numbers in [sparsemma](https://github.com/WizardsForgeGames/sparsemma)). Dense INT8 (cuBLASLt) is faster in raw GEMM throughput; sparse mode trades that for memory.
+- **Sparse mode**: 2:4 structured sparsity + Sparse Tensor Cores via PTX `mma.sp`, using [sparsemma](https://github.com/WizardsForgeGames/sparsemma)'s optimized kernel. 69% weight-memory reduction per layer vs FP16. Measured on an RTX 4090 (2026-10-20):
+  - Per layer, GPU time at the pipeline's real shapes and token counts (`python tools/benchmark.py --hunyuan`): 1.1-2.9x faster than cuBLAS FP16 on 19 of the 20 sparse-mode shapes; 0.55x on the 1280->320 projection at M = 147,456. The sparse layers of one UNet step add up to 44 ms vs 73 ms in FP16 (83 ms with the previous kernel).
+  - End to end (6 views, 512px, 10 steps, sample `004`, median of 3 runs): UNet step 0.682 -> 0.643 s and multiview stage 8.69 -> 8.29 s vs the previous kernel. Linear layers are a small part of each step (attention dominates), so the ~2x layer speedup shows up as ~5% of denoising time.
+  - Numerics: `python tools/test_sparse_numerics.py` checks each shape against FP32 math on the pruned weights (rel. error <= 0.9%). Pruning itself (no fine-tuning) changes outputs; its quality cost is not measured.
 
 ```bash
 # Tensorcore mode (default, recommended)
@@ -171,7 +174,7 @@ Albedo and metallic-roughness texture inpainting run concurrently via ThreadPool
 | `int8_kernels.cu` | Activation quantization (fused per-row absmax + cast) |
 | `build.py` | JIT compilation with ninja |
 
-These kernels are an earlier snapshot of the ones in [sparsemma](https://github.com/WizardsForgeGames/sparsemma), which has the current versions and benchmark numbers.
+`int8_sparse_tc.cu` is [sparsemma](https://github.com/WizardsForgeGames/sparsemma)'s current kernel (synced at sparsemma `6ed9a75`); `int8_gemm_tc.cu` matches sparsemma's and `int8_kernels.cu` differs only in comments. The copies here are ASCII-only so torch's JIT build can read them under non-UTF-8 Windows code pages (e.g. cp932).
 
 Kernels are JIT-compiled on first use via `torch.utils.cpp_extension`. Requires CUDA Toolkit 12.6+ and a C++ compiler (MSVC on Windows, gcc on Linux).
 

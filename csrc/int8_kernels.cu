@@ -2,8 +2,8 @@
  * Fused INT8 quantization/dequantization kernels for Hunyuan3D texture pipeline.
  *
  * Two custom kernels that eliminate the 7-kernel overhead of naive int8 matmul:
- *   1. fused_quantize_activation: fp16 → int8 + scale (per-token dynamic quant)
- *   2. fused_dequantize_bias: int32 × scales + bias → fp16 (output dequant)
+ *   1. fused_quantize_activation: fp16 -> int8 + scale (per-token dynamic quant)
+ *   2. fused_dequantize_bias: int32 x scales + bias -> fp16 (output dequant)
  *
  * Combined with torch._int_mm (cuBLAS INT8 Tensor Cores), this gives us
  * 3 kernel launches instead of 7, cutting ~60-70% of the quant/dequant overhead.
@@ -14,14 +14,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //  Kernel 1: Fused per-token activation quantization
-//  fp16 (M, K) → int8 (M, K) + fp32 scales (M,)
+//  fp16 (M, K) -> int8 (M, K) + fp32 scales (M,)
 //
 //  Each block processes one row. Within a block:
 //    Pass 1: parallel reduction to find max|x| across K elements
 //    Pass 2: quantize all K elements using the computed scale
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 __global__ void fused_quantize_activation_kernel(
     const __half* __restrict__ input,   // (M, K) fp16
@@ -33,7 +33,7 @@ __global__ void fused_quantize_activation_kernel(
     const __half* in_row = input + (size_t)row * K;
     int8_t* out_row = output + (size_t)row * K;
 
-    // ── Pass 1: find max|x| in this row via parallel reduction ──
+    // -- Pass 1: find max|x| in this row via parallel reduction --
 
     float thread_max = 0.0f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
@@ -77,7 +77,7 @@ __global__ void fused_quantize_activation_kernel(
     }
     const float inv_scale = 1.0f / scale;
 
-    // ── Pass 2: quantize ──
+    // -- Pass 2: quantize --
 
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         float val = __half2float(in_row[k]);
@@ -88,13 +88,13 @@ __global__ void fused_quantize_activation_kernel(
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //  Kernel 2: Fused dequantization + bias addition
-//  int32 (M, N) × act_scale (M,) × weight_scale (N,) + bias (N,) → fp16 (M, N)
+//  int32 (M, N) x act_scale (M,) x weight_scale (N,) + bias (N,) -> fp16 (M, N)
 //
 //  Each block handles one row. Threads iterate over columns with vectorized
 //  access where possible. act_scale is loaded once per row (register reuse).
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 __global__ void fused_dequantize_bias_kernel(
     const int32_t* __restrict__ input,      // (M, N) int32
@@ -108,7 +108,7 @@ __global__ void fused_dequantize_bias_kernel(
     const int32_t* in_row = input + (size_t)row * N;
     __half* out_row = output + (size_t)row * N;
 
-    // Load act_scale once per row — reused across all columns
+    // Load act_scale once per row -- reused across all columns
     const float a_scale = act_scale[row];
 
     for (int col = threadIdx.x; col < N; col += blockDim.x) {
@@ -121,9 +121,9 @@ __global__ void fused_dequantize_bias_kernel(
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //  C++ wrappers
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 std::vector<torch::Tensor> fused_quantize_activation(torch::Tensor input) {
     // input: (M, K) fp16 on CUDA
@@ -188,7 +188,7 @@ torch::Tensor fused_dequantize_bias(
 }
 
 
-// Combined: fused_quant → _int_mm → fused_dequant
+// Combined: fused_quant -> _int_mm -> fused_dequant
 // This function is the main entry point called from Python.
 torch::Tensor int8_linear_fused(
     torch::Tensor x,           // (M, K) fp16

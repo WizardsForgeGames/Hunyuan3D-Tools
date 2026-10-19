@@ -8,11 +8,14 @@ Usage:
     python tools/benchmark.py --no-bnb       # skip bitsandbytes (if not installed)
     python tools/benchmark.py --no-sparse    # skip sparse INT8
     python tools/benchmark.py --shapes 1280  # only test layers with dim 1280
+    python tools/benchmark.py --hunyuan      # sparse vs FP16 at the pipeline's real shapes
+    python tools/benchmark.py --hunyuan --compare-sparse-src old/int8_sparse_tc.cu   # A/B
 """
 
 import argparse
 import gc
 import os
+import statistics
 import sys
 import time
 
@@ -155,12 +158,163 @@ def benchmark_shape(in_f, out_f, batch_sizes, use_bnb=True, use_sparse=True):
     gc.collect()
 
 
+# Sparse-mode layers of the paint pipeline at the token counts they see in a 6-view, 512px
+# texture job (captured with forward hooks on every UNet and DINOv2 Linear during a real
+# job; M = rows per call). Rows run every denoising step except DINOv2 (once per job).
+# Omitted: K < 640 layers (FP16 in sparse mode) and the small-M rows that run only in the
+# first step's reference pass (< 2% of the step's sparse FLOPs).
+# (K, N, M, calls, label)
+HUNYUAN_SHAPES = [
+    (640, 640, 36864, 50, "UNet 640-wide attn proj, 64x64 latent"),
+    (1280, 1280, 9216, 50, "UNet 1280-wide attn proj, 32x32 latent"),
+    (640, 5120, 36864, 5, "UNet GEGLU up 640"),
+    (1280, 10240, 9216, 5, "UNet GEGLU up 1280"),
+    (1024, 1280, 37008, 12, "UNet K/V from 1024-d context"),
+    (640, 640, 18432, 55, "UNet 640-wide attn proj"),
+    (1280, 1280, 4608, 55, "UNet 1280-wide attn proj"),
+    (1280, 320, 147456, 5, "UNet 1280->320 proj, 64x64 latent"),
+    (2560, 640, 36864, 5, "UNet FFN down 640"),
+    (5120, 1280, 9216, 5, "UNet FFN down 1280"),
+    (1024, 640, 37008, 10, "UNet K/V from 1024-d context"),
+    (1024, 320, 37008, 10, "UNet K/V from 1024-d context"),
+    (640, 640, 3072, 35, "UNet 640-wide attn proj, small"),
+    (1280, 1280, 768, 35, "UNet 1280-wide attn proj, small"),
+    (1024, 1280, 2772, 12, "UNet K/V from 1024-d context, small"),
+    (1280, 1280, 2304, 10, "UNet 1280-wide attn proj"),
+    (1280, 1280, 1152, 11, "UNet 1280-wide attn proj"),
+    (1536, 1536, 257, 160, "DINOv2-giant q/k/v/o (once per job)"),
+    (1536, 8192, 257, 40, "DINOv2-giant SwiGLU w12 (once per job)"),
+    (4096, 1536, 257, 40, "DINOv2-giant SwiGLU w3 (once per job)"),
+]
+
+
+def time_gpu(fn, warmup=100, reps=300, min_sample_ms=0.2):
+    """GPU time per call: n calls captured in a CUDA graph, median over replays / n.
+
+    Excludes host launch overhead (the pipeline runs the UNet under torch.compile).
+    """
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(20):
+        fn()
+    e.record()
+    torch.cuda.synchronize()
+    est = s.elapsed_time(e) / 20
+    n_inner = max(1, int(min_sample_ms / max(est, 1e-3) + 0.999))
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(st):
+        fn()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(g, stream=st):
+            for _ in range(n_inner):
+                fn()
+    torch.cuda.current_stream().wait_stream(st)
+    for _ in range(warmup):
+        g.replay()
+    torch.cuda.synchronize()
+    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+          for _ in range(reps)]
+    for s, e in ev:
+        s.record(); g.replay(); e.record()
+    torch.cuda.synchronize()
+    return statistics.median(s.elapsed_time(e) for s, e in ev) / n_inner
+
+
+def _load_alt_sparse(src):
+    """Build an alternate sparse kernel source (e.g. an older int8_sparse_tc.cu) for A/B."""
+    from torch.utils.cpp_extension import load
+    from csrc.build import _get_cuda_flags
+    cflags, cuda_flags = _get_cuda_flags()
+    return load(name="int8_sparse_tc_alt", sources=[src], extra_cflags=cflags,
+                extra_cuda_cflags=cuda_flags, verbose=False)
+
+
+def benchmark_hunyuan(rounds, alt_src=None):
+    """Sparse layer vs FP16 on the pipeline's shapes; optional A/B against another kernel source.
+
+    Rounds are interleaved (every variant of every shape is timed once per round, order
+    alternating between rounds); the table shows the median across rounds [min-max].
+    """
+    from quantize_utils import _load_sp
+    variants = [("fp16", None), ("sparse", _load_sp())]
+    if alt_src:
+        variants.insert(1, ("sparse_alt", _load_alt_sparse(alt_src)))
+    print(f"Hunyuan shapes, GPU time per call (CUDA graph), {rounds} interleaved rounds, "
+          f"median [min-max] ms" + (f"\n  sparse_alt = {alt_src}" if alt_src else ""))
+
+    torch.manual_seed(0)
+    cases = []
+    for K, N, M, calls, label in HUNYUAN_SHAPES:
+        lin = nn.Linear(K, N, bias=True).cuda().half()
+        x = torch.randn(M, K, dtype=torch.float16, device="cuda")
+        layers = {}
+        for name, mod in variants:
+            if mod is None:
+                layers[name] = lin
+            else:
+                layer = Int8Linear.from_linear_sparse(lin)
+                layer._sp_ref = mod  # instance-level: this layer runs on `mod`
+                layers[name] = layer
+        cases.append((K, N, M, calls, label, x, layers))
+
+    times = {}  # (case_idx, variant) -> [ms per round]
+    for r in range(rounds):
+        for ci, (_, _, _, _, _, x, layers) in enumerate(cases):
+            names = [v for v, _ in variants]
+            if r % 2:
+                names = names[::-1]
+            for name in names:
+                layer = layers[name]
+                with torch.no_grad():
+                    t = time_gpu(lambda: layer(x))
+                times.setdefault((ci, name), []).append(t)
+
+    def fmt(ts):
+        return f"{statistics.median(ts):.4f} [{min(ts):.4f}-{max(ts):.4f}]"
+
+    names = [v for v, _ in variants]
+    hdr = f"  {'K x N':>11} {'M':>6} | " + " | ".join(f"{n:>24}" for n in names)
+    hdr += " | sparse vs fp16" + (" | alt -> new" if alt_src else "")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    step = {n: 0.0 for n in names}
+    dino = {n: 0.0 for n in names}
+    for ci, (K, N, M, calls, label, _, _) in enumerate(cases):
+        med = {n: statistics.median(times[(ci, n)]) for n in names}
+        for n in names:
+            (dino if label.startswith("DINOv2") else step)[n] += med[n] * calls
+        line = f"  {K:>5}x{N:<5} {M:>6} | " + " | ".join(f"{fmt(times[(ci, n)]):>24}" for n in names)
+        line += f" | {med['fp16'] / med['sparse']:>13.2f}x"
+        if alt_src:
+            line += f" | {med['sparse_alt'] / med['sparse']:>9.2f}x"
+        print(line + f"   {label} (x{calls}/step)")
+    print("  UNet rows, one denoising step (sum of median x calls): " +
+          "  ".join(f"{n}={step[n]:.2f} ms" for n in names))
+    print("  DINOv2 rows, once per job (sum of median x calls):     " +
+          "  ".join(f"{n}={dino[n]:.2f} ms" for n in names))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark quantization methods")
     parser.add_argument("--no-bnb", action="store_true", help="Skip bitsandbytes benchmark")
     parser.add_argument("--no-sparse", action="store_true", help="Skip sparse INT8 benchmark")
     parser.add_argument("--shapes", type=int, nargs="*", help="Only test layers with these dimensions")
+    parser.add_argument("--hunyuan", action="store_true",
+                        help="Sparse vs FP16 on the paint pipeline's sparse-mode shapes and token counts")
+    parser.add_argument("--rounds", type=int, default=3, help="Interleaved rounds for --hunyuan")
+    parser.add_argument("--compare-sparse-src", default=None,
+                        help="With --hunyuan: also time another int8_sparse_tc.cu (A/B)")
     args = parser.parse_args()
+
+    if args.hunyuan:
+        print(f"PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  {torch.cuda.get_device_name(0)}")
+        benchmark_hunyuan(args.rounds, args.compare_sparse_src)
+        return
 
     print(f"PyTorch {torch.__version__}  |  CUDA {torch.version.cuda}  |  {torch.cuda.get_device_name(0)}")
     print(f"torch._int_mm available: {int_mm_available()}")

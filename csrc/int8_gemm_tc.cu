@@ -2,7 +2,7 @@
  * Custom INT8 GEMM kernel using Tensor Core wmma intrinsics.
  *
  * Directly drives the INT8 Tensor Cores via nvcuda::wmma, bypassing cuBLAS.
- * Fuses GEMM + dequantization + bias into a single kernel — no intermediate
+ * Fuses GEMM + dequantization + bias into a single kernel -- no intermediate
  * int32 buffer hitting global memory.
  *
  * Y_fp16[m][n] = sum_k(A_int8[m][k] * B_int8[k][n]) * act_scale[m] * w_scale[n] + bias[n]
@@ -10,7 +10,7 @@
  * Targets SM89 (RTX 4090 Ada Lovelace): 660 TOPS INT8 Tensor Core throughput.
  *
  * Two tile configurations, selected at runtime based on N:
- *   - 128x64:  Better for narrow N (≤2048). 12KB smem, 8 blocks/SM max occupancy.
+ *   - 128x64:  Better for narrow N (<=2048). 12KB smem, 8 blocks/SM max occupancy.
  *   - 128x128: Better for wide N (>2048). 16KB smem, higher arithmetic intensity.
  *
  * Both use 8 warps (4x2), 256 threads, BLOCK_K=64 (4 wmma steps per load).
@@ -24,14 +24,14 @@
 
 using namespace nvcuda;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Templated GEMM kernel — parameterized on BLOCK_N_T (64 or 128)
+// ===============================================================================
+//  Templated GEMM kernel -- parameterized on BLOCK_N_T (64 or 128)
 //
-//  BLOCK_M=128 always. 8 warps (4 in M × 2 in N).
+//  BLOCK_M=128 always. 8 warps (4 in M x 2 in N).
 //  WARP_N = BLOCK_N_T / 2:  32 for 128x64, 64 for 128x128.
-//  Tiles per warp:           2×2 for 128x64, 2×4 for 128x128.
+//  Tiles per warp:           2x2 for 128x64, 2x4 for 128x128.
 //  Accumulators per warp:    4 for 128x64, 8 for 128x128.
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 template <int BLOCK_N_T>
 __global__ void int8_gemm_dequant_kernel(
@@ -63,11 +63,11 @@ __global__ void int8_gemm_dequant_kernel(
     const int warp_row = (warp_id / WARPS_N) * WARP_M;
     const int warp_col = (warp_id % WARPS_N) * WARP_N;
 
-    // ── Shared memory for tiles ──
+    // -- Shared memory for tiles --
     __shared__ int8_t smem_A[BLOCK_M][BLOCK_K];
     __shared__ int8_t smem_B[BLOCK_N_T][BLOCK_K];
 
-    // ── Accumulator fragments in registers ──
+    // -- Accumulator fragments in registers --
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc[TILES_M][TILES_N];
     #pragma unroll
     for (int i = 0; i < TILES_M; i++)
@@ -77,10 +77,10 @@ __global__ void int8_gemm_dequant_kernel(
 
     const int tid = threadIdx.x;
 
-    // ── Outer K-loop ──
+    // -- Outer K-loop --
     for (int k_outer = 0; k_outer < K; k_outer += BLOCK_K) {
 
-        // Load A tile: BLOCK_M × BLOCK_K via 128-bit (int4) loads
+        // Load A tile: BLOCK_M x BLOCK_K via 128-bit (int4) loads
         {
             const int4* src = reinterpret_cast<const int4*>(A + (size_t)block_m * K + k_outer);
             int4* dst = reinterpret_cast<int4*>(&smem_A[0][0]);
@@ -98,7 +98,7 @@ __global__ void int8_gemm_dequant_kernel(
             }
         }
 
-        // Load B tile: BLOCK_N_T × BLOCK_K via 128-bit loads
+        // Load B tile: BLOCK_N_T x BLOCK_K via 128-bit loads
         {
             const int4* src = reinterpret_cast<const int4*>(B + (size_t)block_n * K + k_outer);
             int4* dst = reinterpret_cast<int4*>(&smem_B[0][0]);
@@ -143,12 +143,12 @@ __global__ void int8_gemm_dequant_kernel(
         __syncthreads();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ===========================================================================
     //  Epilogue: dequant + bias via per-warp staging buffer
     //
     //  Reuse smem_A for staging (tiles no longer needed).
-    //  8 warps × 16 × 16 × 4 bytes = 8192 bytes ≤ smem_A size.
-    // ═══════════════════════════════════════════════════════════════════════════
+    //  8 warps x 16 x 16 x 4 bytes = 8192 bytes <= smem_A size.
+    // ===========================================================================
 
     int32_t (*smem_stage)[16][16] = reinterpret_cast<int32_t (*)[16][16]>(&smem_A[0][0]);
 
@@ -183,9 +183,9 @@ __global__ void int8_gemm_dequant_kernel(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //  Activation quantization kernel (standalone copy for this module)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 __global__ void _tc_fused_quantize_kernel(
     const __half* __restrict__ input,
@@ -242,13 +242,13 @@ static std::vector<torch::Tensor> _tc_fused_quantize(torch::Tensor input) {
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  C++ wrappers — dispatch to 128x64 or 128x128 kernel based on N
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
+//  C++ wrappers -- dispatch to 128x64 or 128x128 kernel based on N
+// ===============================================================================
 
 // N threshold: use wide (128x128) tile when N > this value.
 // 128x128 has higher arithmetic intensity but fewer N-blocks per SM.
-// 128x64 is better when N is small (more blocks → better SM utilization).
+// 128x64 is better when N is small (more blocks -> better SM utilization).
 static constexpr int WIDE_N_THRESHOLD = 2048;
 
 torch::Tensor int8_gemm_tc(
