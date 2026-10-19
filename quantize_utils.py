@@ -14,7 +14,7 @@ Four compute backends (auto-selected per layer):
      (FFN up-projections) by 1.1-1.3x. Requires K % 64 == 0, N % 16 == 0.
 
   3. "dequant" — Dequantize int8 weights to fp16 on-the-fly, then fp16
-     matmul. ~Same speed as nn.Linear but ~50% weight VRAM savings.
+     matmul. ~Same speed as nn.Linear; weight memory about the same as FP16 (stores two INT8 layouts).
      Used as fallback when TC requirements aren't met.
 
   4. "bnb" — bitsandbytes Linear8bitLt with mixed-precision decomposition.

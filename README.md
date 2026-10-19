@@ -134,7 +134,7 @@ Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15)
 
 Custom CUDA kernels replace all Linear layers in the multiview UNet and DINOv2:
 
-- **Tensorcore mode**: Custom wmma INT8 GEMM kernel. Fuses GEMM + dequant + bias. 50% weight VRAM savings, ~1.0-1.3x FP16 speed.
+- **Tensorcore mode**: Custom wmma INT8 GEMM kernel. Fuses GEMM + dequant + bias. ~1.0-1.3x FP16 speed. Note: it currently keeps two INT8 weight layouts (N×K for the Tensor Core path, K×N for the small-batch fallback), so weight memory is about the same as FP16; only sparse mode reduces it (69%).
 - **Sparse mode**: 2:4 structured sparsity + Sparse Tensor Cores via PTX `mma.sp`. Measured: 69% weight-memory reduction per layer vs FP16 and 1.3-1.5x vs cuBLAS FP16 on the large FFN layers at M >= 4096 (numbers in [sparsemma](https://github.com/WizardsForgeGames/sparsemma)). Dense INT8 (cuBLASLt) is faster in raw GEMM throughput; sparse mode trades that for memory.
 
 ```bash
