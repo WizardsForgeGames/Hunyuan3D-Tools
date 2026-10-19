@@ -6,9 +6,11 @@ Four compute backends (auto-selected per layer):
      Prunes 50% of weights (2:4 pattern), compresses, and uses Sparse
      Tensor Cores. Requires K % 64 == 0, N % 16 == 0. Measured: 69% weight
      memory reduction per layer vs FP16 (incl. metadata/scales). Kernel is
-     sparsemma's optimized one; on the paint pipeline's sparse-mode shapes it
-     runs 1.1-2.9x faster than cuBLAS FP16 per layer (GPU time, RTX 4090),
-     except narrow N=320 at very large M (tools/benchmark.py --hunyuan).
+     sparsemma's optimized one; on the paint UNet's sparse-mode shapes it
+     runs 1.2-2.8x faster than cuBLAS FP16 per layer (GPU time, RTX 4090,
+     tools/benchmark.py --hunyuan). Narrow layers at large M (1280->320 at
+     147k tokens) fuse the activation quantize into the GEMM, so the int8
+     copy of the activation never round-trips through DRAM.
 
   2. "tc" — Custom INT8 Tensor Core GEMM via wmma intrinsics. Fuses
      GEMM + dequant + bias in one kernel. Beats FP16 on wide layers

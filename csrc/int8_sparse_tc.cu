@@ -449,8 +449,15 @@ __global__ void pack_metadata_kernel(
 //    BLOCK_WR_T: 128 (standard) or 256 (tall tile, higher arithmetic intensity)
 //    BLOCK_BC_T: 64 (narrow) or 128 (wide) batch columns
 //  3-stage cp.async pipeline: two tiles prefetched ahead of compute for better
-//  latency hiding. Persistent CTAs (one per SM) walk tiles in M-fastest order;
-//  tile shape and split-K come from the cost model in sparse_int8_gemm.
+//  latency hiding. Persistent CTAs (one per SM) walk tiles in M-fastest order
+//  (N-fastest once the int8 activation exceeds L2); tile shape and split-K come from
+//  the cost model (sp_plan).
+//
+//  FQ = true (sparse_gemm_fq_kernel, 128x64 only): fused activation quantize. B is not
+//  pipelined: each CTA quantizes its 64-token block (full K <= 1280) from fp16 into a
+//  resident smem block once, runs every weight tile against it (N-fastest), and
+//  prefetches its next block into L2 meanwhile. Removes the int8 activation's DRAM
+//  round trip on large-M, narrow-N layers (see sp_use_fused).
 //
 //  Grid: (ceil(N_out/BLOCK_WR_T), ceil(M/BLOCK_BC_T))
 // ===============================================================================
@@ -470,8 +477,10 @@ constexpr int SP_STAGE_PAD = 9;     // epilogue staging pad for bank conflicts
 //                   is barrier/latency-bound rather than L2-bound.
 //   META_STEPS = 4: 32 bytes (4 K steps) per row into a 2-slot ring every 4th K step: full
 //                   sectors, ~25% less L2 traffic for the large, L2-bound tiles.
-template <int BW, int BC>
-constexpr int sp_meta_steps() { return (BC == 64) ? 1 : 4; }
+// FQ (fused quantize, see sp_fq_base_bytes) 128x64: 2-step chunks (16 B/row, 2 stages ahead
+// need META_STEPS >= 2); its K loop streams only weights, so metadata sectors matter more.
+template <int BW, int BC, bool FQ = false>
+constexpr int sp_meta_steps() { return (BC == 64) ? (FQ ? 2 : 1) : 4; }
 
 // Pipeline depth of the occupancy-1 kernel per tile (A+B per stage: 16 / 12 / 8 KB).
 // Total smem is padded to just over half an SM anyway (one CTA per SM, see launch).
@@ -479,6 +488,22 @@ template <int BW, int BC>
 constexpr int sp_stages() {
     return (BW == 256) ? 3 : (BC == 128) ? 3 : 3;
 }
+
+// Fused-quantize (FQ) path layout: [A+metadata pipeline | epilogue staging] (the larger of
+// the two), then the resident int8 activation block (BC rows x full K, stored as K steps in
+// the pipeline's B-stage layout), then BC fp32 per-token scales.
+template <int BW, int BC>
+constexpr int sp_fq_base_bytes() {
+    constexpr int MS   = sp_meta_steps<BW, BC, true>();
+    constexpr int PIPE = sp_stages<BW, BC>() * (BW * SP_K_COMP + (MS == 1 ? BW * 8 : 0))
+                       + (MS == 1 ? 0 : 2 * BW * MS * 8);
+    constexpr int STG  = BC * BW * 2;
+    return PIPE > STG ? PIPE : STG;
+}
+// Register-staged row quantize: each lane holds FQ_VPT 16-byte vectors of a row
+// (K <= FQ_VPT * 256 = 1280).
+template <int BC>
+constexpr int sp_fq_vpt() { return 5; }
 
 template <int BW, int BC, int STAGES>
 constexpr int sp_smem_bytes() {
@@ -505,7 +530,9 @@ __global__ void splitk_reduce_kernel(
     output[idx] = __float2half(val);
 }
 
-template <int BLOCK_WR_T, int BLOCK_BC_T, int DB_STAGES_T>
+// NF: N-fastest tile order (FQ always; the two-kernel GEMM when the int8 activation
+// exceeds L2). A template parameter so the M-fastest kernels compile exactly as before.
+template <int BLOCK_WR_T, int BLOCK_BC_T, int DB_STAGES_T, bool FQ = false, bool NF = FQ>
 __device__ __forceinline__ void sparse_gemm_impl(
     const int8_t*   __restrict__ W_comp,     // (N_out, K/2) compressed weight
     const int8_t*   __restrict__ x_int8,     // (M, K) quantized activation
@@ -517,7 +544,9 @@ __device__ __forceinline__ void sparse_gemm_impl(
     float*          __restrict__ splitk_ws,  // split-K fp32 workspace, or nullptr
     const int M, const int K, const int N_out,
     const int split_k,             // 1 = normal, >1 = split-K mode
-    const int k_iters_per_split    // K iterations per split (ceiling)
+    const int k_iters_per_split,   // K iterations per split (ceiling)
+    const __half* __restrict__ x_fp16,  // FQ: (M, K) fp16 activation, quantized in-kernel
+    const int x_stream                  // FQ: evict-first loads of x_fp16 (input > L2)
 ) {
     // -- Derived constants from template parameters --
     constexpr int WARP_WR = BLOCK_WR_T / SP_WARPS_WR;       // 32 or 64
@@ -528,15 +557,20 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
     // Pipelined smem: DB_STAGES x (A_tile + B_tile), then a 2-slot metadata ring
     constexpr int SMEM_A_STAGE = BLOCK_WR_T * SP_K_COMP;             // 4096 or 8192
-    constexpr int SMEM_B_STAGE = BLOCK_BC_T * SP_BLOCK_K;            // 4096 or 8192
+    constexpr int SMEM_B_STAGE = FQ ? 0 : BLOCK_BC_T * SP_BLOCK_K;   // 4096 or 8192 (FQ: resident)
     // Sparsity metadata: see sp_meta_steps (per-stage slot, or a 2-slot 4-step ring)
-    constexpr int META_STEPS   = sp_meta_steps<BLOCK_WR_T, BLOCK_BC_T>();
+    constexpr int META_STEPS   = sp_meta_steps<BLOCK_WR_T, BLOCK_BC_T, FQ>();
+    // Ring slot swizzle: rows 16/META_STEPS apart share banks; XOR their 8-byte step slot
+    constexpr int MQ_SHIFT     = (META_STEPS == 2) ? 3 : 2;
     constexpr int SMEM_M_STAGE = (META_STEPS == 1) ? BLOCK_WR_T * 8 : 0;
     constexpr int SMEM_PER_STAGE = SMEM_A_STAGE + SMEM_B_STAGE + SMEM_M_STAGE;
     constexpr int SMEM_M_SLOT  = (META_STEPS == 1) ? 0 : BLOCK_WR_T * META_STEPS * 8;
     constexpr int SMEM_M_OFF   = DB_STAGES * SMEM_PER_STAGE;
     constexpr int SMEM_DB      = SMEM_M_OFF + 2 * SMEM_M_SLOT;
-    static_assert(SMEM_DB == sp_smem_bytes<BLOCK_WR_T, BLOCK_BC_T, DB_STAGES>(), "smem layout");
+    static_assert(FQ || SMEM_DB == sp_smem_bytes<BLOCK_WR_T, BLOCK_BC_T, DB_STAGES>(), "smem layout");
+    // FQ: resident activation block offset (after the pipeline / epilogue staging region)
+    constexpr int SMEM_FQ_B = FQ ? sp_fq_base_bytes<BLOCK_WR_T, BLOCK_BC_T>() : 0;
+    static_assert(!FQ || SMEM_FQ_B >= SMEM_DB, "FQ layout");
     static_assert(META_STEPS == 1 || META_STEPS >= DB_STAGES - 1,
                   "2-slot metadata ring needs META_STEPS >= DB_STAGES - 1");
     // Epilogue staging (reuses smem after K-loop)
@@ -582,6 +616,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
     const int tile_start = blockIdx.x * tiles_per_cta;
     const int tile_end   = min(tile_start + tiles_per_cta, total_tiles);
 
+    [[maybe_unused]] int res_m = -1;   // FQ: M-tile whose activation block is resident in smem
+
     for (int tile_id = tile_start; tile_id < tile_end; tile_id++) {
 
     // -- Decode tile_id -> (spatial_id, k_split_id) --
@@ -594,8 +630,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
     // M-fastest: consecutive tiles of a CTA (block-partitioned) share the weight tile,
     // and co-running CTAs mostly share weight rows. Measured faster than N-fastest and
     // than banded/grouped orders on the headline shapes.
-    const int tile_n = spatial_id / tiles_y;
-    const int tile_m = spatial_id % tiles_y;
+    // N-fastest (FQ always; two-kernel path when the int8 activation exceeds L2): the CTA
+    // runs every weight tile against one activation block before moving on, so the
+    // activation is read from DRAM once instead of once per weight-tile column.
+    const int tile_n = NF ? spatial_id % tiles_x : spatial_id / tiles_y;
+    const int tile_m = NF ? spatial_id / tiles_x : spatial_id % tiles_y;
 
     // -- K-range for this split --
     const int k_start_iter  = k_split_id * k_iters_per_split;
@@ -605,6 +644,94 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
     const int block_wr = tile_n * BLOCK_WR_T;
     const int block_bc = tile_m * BLOCK_BC_T;
+
+    // ================================================================
+    //  FQ: quantize this M-tile's activation rows into the resident smem block
+    //  (once per M-tile; consecutive tiles of a CTA share it, N-fastest order).
+    //  Each warp quantizes BLOCK_BC_T/8 rows, two at a time: a lane holds up to
+    //  FQ_VPT 16-byte vectors of each row in registers, the warp reduces the row
+    //  absmax with shuffles, then stores 8 int8 per vector in the B-stage layout of
+    //  K step k/64. Arithmetic matches _sp_quantize_vec_kernel (bit-identical).
+    //  The previous tile's trailing __syncthreads() protects the overwrite.
+    // ================================================================
+    if constexpr (FQ) {
+        if (tile_m != res_m) {
+            res_m = tile_m;
+            constexpr int FQ_VPT = sp_fq_vpt<BLOCK_BC_T>();
+            constexpr int ROWS_PER_WARP = BLOCK_BC_T / (SP_THREADS / 32);
+            const int nvec = K / 8;
+            float* s_scale = reinterpret_cast<float*>(smem_raw + SMEM_FQ_B + BLOCK_BC_T * K);
+            #pragma unroll 1
+            for (int rr = 0; rr < ROWS_PER_WARP; rr += 2) {
+                uint4 v[2][FQ_VPT];
+                float amax[2];
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    const int r = warp * ROWS_PER_WARP + rr + u;
+                    const uint4* src = reinterpret_cast<const uint4*>(
+                        x_fp16 + (size_t)min(block_bc + r, M - 1) * K);
+                    amax[u] = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < FQ_VPT; i++) {
+                        const int idx = lane + 32 * i;
+                        if (idx < nvec) {
+                            v[u][i] = x_stream ? __ldcs(src + idx) : src[idx];
+                            const __half2* h = reinterpret_cast<const __half2*>(&v[u][i]);
+                            #pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                const float2 f = __half22float2(h[j]);
+                                amax[u] = fmaxf(amax[u], fmaxf(fabsf(f.x), fabsf(f.y)));
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        amax[u] = fmaxf(amax[u], __shfl_xor_sync(0xffffffff, amax[u], o));
+                    const int r = warp * ROWS_PER_WARP + rr + u;
+                    const float scale = fmaxf(amax[u], 1e-8f) / 127.0f;
+                    const float inv_scale = 1.0f / scale;
+                    if (lane == 0) s_scale[r] = scale;
+                    #pragma unroll
+                    for (int i = 0; i < FQ_VPT; i++) {
+                        const int idx = lane + 32 * i;
+                        if (idx < nvec) {
+                            const __half2* h = reinterpret_cast<const __half2*>(&v[u][i]);
+                            uint32_t packed[2] = {0u, 0u};
+                            #pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                const float2 f = __half22float2(h[j]);
+                                const int q0 = max(-128, min(127, __float2int_rn(f.x * inv_scale)));
+                                const int q1 = max(-128, min(127, __float2int_rn(f.y * inv_scale)));
+                                packed[j >> 1] |= ((uint32_t)(q0 & 0xFF) << (16 * (j & 1)))
+                                                | ((uint32_t)(q1 & 0xFF) << (16 * (j & 1) + 8));
+                            }
+                            const int k = idx * 8;
+                            const uint32_t a = smem_base + SMEM_FQ_B
+                                + (uint32_t)((k / SP_BLOCK_K) * (BLOCK_BC_T * SP_BLOCK_K)
+                                             + r * SP_BLOCK_K + b_swiz(r, k % SP_BLOCK_K));
+                            asm volatile("st.shared.v2.u32 [%0], {%1, %2};\n"
+                                         :: "r"(a), "r"(packed[0]), "r"(packed[1]));
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            // Prefetch the CTA's next M-tile (contiguous rows of x) into L2 now, so its DRAM
+            // read overlaps this M-tile's K loops and its quantize phase above hits L2.
+            const int nm = tile_m + 1;
+            if (nm < tiles_y && nm * tiles_x < tile_end) {
+                const char* pf_base = reinterpret_cast<const char*>(x_fp16 + (size_t)nm * BLOCK_BC_T * K);
+                const int pf_lines = min(BLOCK_BC_T, M - nm * BLOCK_BC_T) * (K / 64);   // 128-byte lines
+                for (int l = t; l < pf_lines; l += SP_THREADS)
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(pf_base + (size_t)l * 128));
+                // Measured on 1280x320, M=147456: no prefetch 0.774 ms, this 0.689; issuing it
+                // before the quantize phase 0.793, two M-tiles ahead 0.779, evict_last 0.721.
+            }
+        }
+    }
 
     // -- Accumulators: TILES_M M-tiles x TILES_N N-tiles x 4 int32 --
     int32_t acc[TILES_M][TILES_N][4];
@@ -651,8 +778,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
         a_src[it] = W_comp + (size_t)min(block_wr + row, N_out - 1) * K_comp + col;
         a_dst[it] = row * SP_K_COMP + a_swiz(row, col);
     }
-    const int8_t* b_src[B_ITERS];
-    uint32_t      b_dst[B_ITERS];
+    [[maybe_unused]] const int8_t* b_src[B_ITERS];   // unused by FQ (B is resident)
+    [[maybe_unused]] uint32_t      b_dst[B_ITERS];
     #pragma unroll
     for (int it = 0; it < B_ITERS; it++) {
         const int row = t / B_CPR + it * (SP_THREADS / B_CPR);
@@ -677,7 +804,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
         m_src[it] = w_meta + (size_t)min(block_wr + row, N_out - 1) * meta_cols + 2 * m_j;
         m_dst[it] = (META_STEPS == 1)
             ? (uint32_t)(SMEM_A_STAGE + SMEM_B_STAGE + row * 8)            // stage-relative
-            : (uint32_t)(row * (META_STEPS * 8) + ((m_j ^ ((row >> 2) & 3)) << 3));
+            : (uint32_t)(row * (META_STEPS * 8)
+                         + ((m_j ^ ((row >> MQ_SHIFT) & (META_STEPS - 1))) << 3));
     }
 
     // Async load of absolute K step K_ABS into the stage at smem byte offset STAGE_OFF.
@@ -686,9 +814,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
         _Pragma("unroll")                                                          \
         for (int _it = 0; _it < A_ITERS; _it++)                                   \
             cp_async_16_u32(_so + a_dst[_it], a_src[_it] + (K_ABS) * SP_K_COMP);  \
-        _Pragma("unroll")                                                          \
-        for (int _it = 0; _it < B_ITERS; _it++)                                   \
-            cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
+        if constexpr (!FQ) {                                                       \
+            _Pragma("unroll")                                                      \
+            for (int _it = 0; _it < B_ITERS; _it++)                               \
+                cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
+        }                                                                          \
         if constexpr (META_STEPS == 1) {                                           \
             if (m_loader)                                                          \
                 cp_async_8_u32(_so + m_dst[0], m_src[0] + (K_ABS) * 2);            \
@@ -726,10 +856,11 @@ __device__ __forceinline__ void sparse_gemm_impl(
     }();
     const uint32_t b_ldm_off = [&] {
         const int row = warp_bc + (lane & 7);
-        return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, (lane >> 3) << 4));
+        return (uint32_t)((FQ ? SMEM_FQ_B : SMEM_A_STAGE) + row * SP_BLOCK_K
+                          + b_swiz(row, (lane >> 3) << 4));
     }();
     const int      m_row     = warp_wr + groupID + ((tid & 1) << 3);
-    const int      m_q       = (m_row >> 2) & 3;
+    const int      m_q       = (m_row >> MQ_SHIFT) & (META_STEPS - 1);
     const uint32_t m_ldm_off = (META_STEPS == 1 ? SMEM_A_STAGE + SMEM_B_STAGE : SMEM_M_OFF)
                              + (uint32_t)(m_row * (META_STEPS * 8) + (tid >> 1) * 4);
 
@@ -764,6 +895,12 @@ __device__ __forceinline__ void sparse_gemm_impl(
             LOAD_TILE(ahead_off, k_start_iter + k_ahead);
 
         const uint32_t cur = smem_base + comp_off;
+        // B fragments: the current pipeline stage, or (FQ) K step k of the resident block
+        const uint32_t bcur = FQ ? smem_base + (uint32_t)((k_start_iter + ki) * (BLOCK_BC_T * SP_BLOCK_K))
+                                 : cur;
+
+        // FQ: warps whose weight rows are all past N_out (narrow N, last tile) skip the math
+        if (!FQ || block_wr + warp_wr < N_out) {
 
         // -- Metadata from the shared-memory ring (staged by LOAD_TILE) --
         // One conflict-free LDS per M-tile.
@@ -803,7 +940,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
             asm volatile(
                 "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(b_frag0[0]), "=r"(b_frag0[1]), "=r"(b_frag1[0]), "=r"(b_frag1[1])
-                : "r"(cur + b_ldm_off + nj * 8 * SP_BLOCK_K)
+                : "r"(bcur + b_ldm_off + nj * 8 * SP_BLOCK_K)
             );
 
             #pragma unroll
@@ -831,6 +968,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
                 );
             }
         }
+        }   // warp-live
 
         // Rotate stage offsets
         comp_off  = (comp_off  + SMEM_PER_STAGE == DB_STAGES * SMEM_PER_STAGE) ? 0 : comp_off  + SMEM_PER_STAGE;
@@ -849,6 +987,13 @@ __device__ __forceinline__ void sparse_gemm_impl(
     //  No shared memory, so no extra CTA barrier before the next tile.
     // ================================================================
     {
+        // Per-token activation scale: global, or (FQ) the block's smem copy
+        auto act_sc = [&](int bc) -> float {
+            if constexpr (FQ)
+                return reinterpret_cast<const float*>(smem_raw + SMEM_FQ_B + BLOCK_BC_T * K)[bc - block_bc];
+            else
+                return act_scale[min(bc, M - 1)];
+        };
         float ws_r[TILES_M][2], bias_r[TILES_M][2];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++) {
@@ -866,8 +1011,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
             #pragma unroll
             for (int nj = 0; nj < TILES_N; nj++) {
                 const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
-                const float as0 = act_scale[min(bc_frag,     M - 1)];
-                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
+                const float as0 = act_sc(bc_frag);
+                const float as1 = act_sc(bc_frag + 1);
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
                     #pragma unroll
@@ -892,7 +1037,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
             constexpr int ROW_B = WARP_WR * 2;              // staged row pitch (bytes)
             constexpr int CPR   = WARP_WR / 8;              // 16-byte chunks per row (8 or 4)
             static_assert(CPR == 8 || CPR == 4, "staging swizzle assumes 4 or 8 chunks per row");
-            static_assert(SP_WARPS_WR * SP_WARPS_BC * WARP_BC * ROW_B <= SMEM_DB,
+            static_assert(SP_WARPS_WR * SP_WARPS_BC * WARP_BC * ROW_B <= (FQ ? SMEM_FQ_B : SMEM_DB),
                           "epilogue staging must fit in the pipeline buffers");
             // XOR swizzle of the 16-byte chunk: conflict-free for the 8-row fragment stores
             // and for the 16-byte row reads.
@@ -903,8 +1048,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
             #pragma unroll
             for (int nj = 0; nj < TILES_N; nj++) {
                 const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
-                const float as0 = act_scale[min(bc_frag,     M - 1)];
-                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
+                const float as0 = act_sc(bc_frag);
+                const float as1 = act_sc(bc_frag + 1);
                 const int r = nj * 8 + groupID;                              // row after transpose
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
@@ -962,18 +1107,27 @@ __device__ __forceinline__ void sparse_gemm_impl(
     __half*         __restrict__ output,                            \
     float*          __restrict__ splitk_ws,                         \
     const int M, const int K, const int N_out,                     \
-    const int split_k, const int k_iters_per_split
+    const int split_k, const int k_iters_per_split,                \
+    const __half* __restrict__ x_fp16, const int x_stream
 
 #define SPARSE_GEMM_ARGS \
     W_comp, x_int8, w_meta, act_scale, w_scale, bias, output, \
-    splitk_ws, M, K, N_out, split_k, k_iters_per_split
+    splitk_ws, M, K, N_out, split_k, k_iters_per_split, x_fp16, x_stream
 
 // Occupancy-1 kernel (original behavior, deep pipeline).
 // Cap smem at 48KB to stay in 64KB config tier -> preserve 64KB L1 cache.
-template <int BLOCK_WR_T, int BLOCK_BC_T>
+template <int BLOCK_WR_T, int BLOCK_BC_T, bool NF = false>
 __global__ void sparse_gemm_kernel(SPARSE_GEMM_PARAMS) {
     constexpr int STAGES = sp_stages<BLOCK_WR_T, BLOCK_BC_T>();
-    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, STAGES>(SPARSE_GEMM_ARGS);
+    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, STAGES, false, NF>(SPARSE_GEMM_ARGS);
+}
+
+// Fused-quantize kernel: reads the fp16 activation, quantizes each M-tile's rows into a
+// resident smem block, runs every weight tile against it (see sparse_int8_linear_ex).
+template <int BLOCK_WR_T, int BLOCK_BC_T>
+__global__ void sparse_gemm_fq_kernel(SPARSE_GEMM_PARAMS) {
+    constexpr int STAGES = sp_stages<BLOCK_WR_T, BLOCK_BC_T>();
+    sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, STAGES, true>(SPARSE_GEMM_ARGS);
 }
 
 // Occupancy-2 kernel: __launch_bounds__(256, 2) forces <=128 regs/thread.
@@ -1552,6 +1706,52 @@ std::vector<torch::Tensor> sparse_quantize_act(torch::Tensor x) {
     return {x_int8, act_scale};
 }
 
+// Dispatch: pick (tile, split-K) by a wave-aware cost model fitted on an RTX 4090
+// sweep (K 1280..6144 x N 768..6144 x M 64..8192, every tile x split):
+//   t(tile, s) = waves * (a_tile * ceil(ksteps / s) + b_tile)
+//              + [s > 1] * (c0 + (c1 + c2 * s) * M*N/1e6)
+//   waves      = ceil(spatial_tiles(tile) * s / SMs)   (one persistent CTA per SM)
+// a_tile: time per 64-deep K step of one tile, b_tile: per-tile fixed cost (pipeline
+// fill, epilogue), c0/c1/c2: split-K launch, workspace memset + reduce, atomics.
+// Splits above 6 lost on every measured shape (atomic contention on the M x N
+// partials outgrows the extra parallelism), so they are not candidates.
+// Wave quantization dominates small and mid shapes, which fixed M/N thresholds miss.
+// The model is compute-side only (every sweep shape keeps its int8 activation in L2);
+// DRAM effects are handled by the tile order (sparse_int8_gemm) and by the fused path
+// (sp_use_fused).
+static const int    kSpTileBW[3] = {256, 128, 128};
+static const int    kSpTileBC[3] = {128, 128, 64};
+static const double kSpA[3] = {8.1730e-04, 4.0900e-04, 3.1130e-04};   // ms per K step per tile
+static const double kSpB[3] = {3.5480e-03, 2.2260e-03, 1.2530e-03};   // ms per tile
+
+struct SpPlan { int tile; int split_k; double cost; };
+
+static SpPlan sp_plan(int M, int K, int N_out, int sms, int force_tile, int force_split) {
+    constexpr double kSplitC0 = 2.9200e-03;                      // ms per split-K launch
+    constexpr double kSplitC1 = 1.1810e-03;                      // ms per 1e6 outputs
+    constexpr double kSplitC2 = 2.4990e-03;                      // ms per 1e6 outputs per split
+    static const int kSplits[] = {1, 2, 3, 4, 6};
+    const int k_iters_total = K / SP_BLOCK_K;
+    SpPlan plan{-1, 1, 1e30};
+    for (int t = 0; t < 3; t++) {
+        if (force_tile >= 0 && t != force_tile) continue;
+        const long long tiles = (long long)((N_out + kSpTileBW[t] - 1) / kSpTileBW[t])
+                              * ((M + kSpTileBC[t] - 1) / kSpTileBC[t]);
+        for (int s : kSplits) {
+            if (force_split >= 1 && s != force_split) continue;
+            if (force_split < 1 && s > 1 && s > k_iters_total / 2) continue;
+            const long long waves = (tiles * s + sms - 1) / sms;
+            const int ksteps = (k_iters_total + s - 1) / s;
+            double cost = (double)waves * (kSpA[t] * ksteps + kSpB[t]);
+            if (s > 1) cost += kSplitC0 + (kSplitC1 + kSplitC2 * s) * ((double)M * N_out * 1e-6);
+            if (cost < plan.cost) plan = {t, s, cost};
+        }
+    }
+    if (force_split >= 1 && plan.tile < 0)   // forced split outside the candidate list
+        plan = {(force_tile >= 0) ? force_tile : 1, force_split, 0.0};
+    return plan;
+}
+
 // Sparse GEMM + dequant + bias on pre-quantized activations.
 //   force_tile: -1 = heuristic, 0 = 256x128, 1 = 128x128, 2 = 128x64
 //   force_split: -1 = heuristic, >= 1 = that split-K factor
@@ -1563,7 +1763,8 @@ torch::Tensor sparse_int8_gemm(
     torch::Tensor w_scale,     // (N_out,) fp16 weight scale
     torch::Tensor bias,        // (N_out,) fp16 or empty tensor
     int64_t force_tile,
-    int64_t force_split
+    int64_t force_split,
+    int64_t force_order
 ) {
     TORCH_CHECK(x_int8.is_cuda() && x_int8.dtype() == torch::kInt8, "x_int8 must be int8 CUDA");
     TORCH_CHECK(x_int8.dim() == 2 && x_int8.is_contiguous(), "x_int8 must be 2D contiguous");
@@ -1594,51 +1795,20 @@ torch::Tensor sparse_int8_gemm(
         ? reinterpret_cast<const __half*>(bias.data_ptr<at::Half>())
         : nullptr;
 
-    // Dispatch: pick (tile, split-K) by a wave-aware cost model fitted on an RTX 4090
-    // sweep (K 1280..6144 x N 768..6144 x M 64..8192, every tile x split):
-    //   t(tile, s) = waves * (a_tile * ceil(ksteps / s) + b_tile)
-    //              + [s > 1] * (c0 + (c1 + c2 * s) * M*N/1e6)
-    //   waves      = ceil(spatial_tiles(tile) * s / SMs)   (one persistent CTA per SM)
-    // a_tile: time per 64-deep K step of one tile, b_tile: per-tile fixed cost (pipeline
-    // fill, epilogue), c0/c1/c2: split-K launch, workspace memset + reduce, atomics.
-    // Splits above 6 lost on every measured shape (atomic contention on the M x N
-    // partials outgrows the extra parallelism), so they are not candidates.
-    // Wave quantization dominates small and mid shapes, which fixed M/N thresholds miss.
     const int SP_MAX_CTAS = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const int k_iters_total = K / SP_BLOCK_K;
-    static const int    kTileBW[3] = {256, 128, 128};
-    static const int    kTileBC[3] = {128, 128, 64};
-    static const double kA[3] = {8.1730e-04, 4.0900e-04, 3.1130e-04};   // ms per K step per tile
-    static const double kB[3] = {3.5480e-03, 2.2260e-03, 1.2530e-03};   // ms per tile
-    constexpr double kSplitC0 = 2.9200e-03;                      // ms per split-K launch
-    constexpr double kSplitC1 = 1.1810e-03;                      // ms per 1e6 outputs
-    constexpr double kSplitC2 = 2.4990e-03;                      // ms per 1e6 outputs per split
-    static const int    kSplits[] = {1, 2, 3, 4, 6};
-
-    int tile = -1, split_k = 1;
-    double best_cost = 1e30;
-    for (int t = 0; t < 3; t++) {
-        if (force_tile >= 0 && t != force_tile) continue;
-        const long long tiles = (long long)((N_out + kTileBW[t] - 1) / kTileBW[t])
-                              * ((M + kTileBC[t] - 1) / kTileBC[t]);
-        for (int s : kSplits) {
-            if (force_split >= 1 && s != force_split) continue;
-            if (force_split < 1 && s > 1 && s > k_iters_total / 2) continue;
-            const long long waves = (tiles * s + SP_MAX_CTAS - 1) / SP_MAX_CTAS;
-            const int ksteps = (k_iters_total + s - 1) / s;
-            double cost = (double)waves * (kA[t] * ksteps + kB[t]);
-            if (s > 1) cost += kSplitC0 + (kSplitC1 + kSplitC2 * s) * ((double)M * N_out * 1e-6);
-            if (cost < best_cost) { best_cost = cost; tile = t; split_k = s; }
-        }
-    }
-    if (force_split >= 1 && tile < 0) {   // forced split outside the candidate list
-        tile = (force_tile >= 0) ? (int)force_tile : 1;
-        split_k = (int)force_split;
-    }
-    const int BW = kTileBW[tile], BC = kTileBC[tile];
+    const SpPlan plan = sp_plan(M, K, N_out, SP_MAX_CTAS, (int)force_tile, (int)force_split);
+    const int tile = plan.tile, split_k = plan.split_k;
+    const int BW = kSpTileBW[tile], BC = kSpTileBC[tile];
     const int spatial_tiles = ((N_out + BW - 1) / BW) * ((M + BC - 1) / BC);
 
     const int k_iters_per_split = (k_iters_total + split_k - 1) / split_k;
+
+    // Tile order: M-fastest keeps a weight tile hot across consecutive M-tiles, but every
+    // weight-tile column then streams the whole int8 activation; once that exceeds L2 it is
+    // re-read from DRAM per column (3x for N_out = 320 on 128-row tiles). N-fastest reads it once.
+    const int n_fastest = (force_order >= 0) ? (int)force_order
+        : ((long long)M * K > (long long)at::cuda::getCurrentDeviceProperties()->l2CacheSize) ? 1 : 0;
 
     // Allocate split-K workspace if needed
     torch::Tensor splitk_ws;
@@ -1649,7 +1819,7 @@ torch::Tensor sparse_int8_gemm(
         splitk_ws_ptr = splitk_ws.data_ptr<float>();
     }
 
-    #define LAUNCH_SPARSE_GEMM(BWv, BCv) do {                                      \
+    #define LAUNCH_SPARSE_GEMM(BWv, BCv, NFv) do {                                      \
         /* One persistent CTA per SM. When registers and smem would allow two, the */\
         /* block scheduler can place two of the #SMs CTAs on one SM and leave     */\
         /* another idle (measured: 128x64 at 96 regs ran 12-19% slower), and two  */\
@@ -1664,12 +1834,12 @@ torch::Tensor sparse_int8_gemm(
             _smem = (_smem_k > _half) ? _smem_k : _half;                           \
             if (_smem > (int)_p->sharedMemPerBlockOptin) _smem = _smem_k;          \
             if (_smem > 48 * 1024)                                                 \
-                cudaFuncSetAttribute(sparse_gemm_kernel<(BWv), (BCv)>,             \
+                cudaFuncSetAttribute(sparse_gemm_kernel<(BWv), (BCv), (NFv)>,      \
                     cudaFuncAttributeMaxDynamicSharedMemorySize, _smem);           \
         }                                                                          \
         const int _total = spatial_tiles * split_k;                                \
         const int _nctas = (_total < SP_MAX_CTAS) ? _total : SP_MAX_CTAS;          \
-        sparse_gemm_kernel<(BWv), (BCv)><<<_nctas, SP_THREADS, _smem, stream>>>(   \
+        sparse_gemm_kernel<(BWv), (BCv), (NFv)><<<_nctas, SP_THREADS, _smem, stream>>>( \
             w_comp.data_ptr<int8_t>(),                                             \
             x_int8.data_ptr<int8_t>(),                                             \
             reinterpret_cast<const uint32_t*>(w_meta.data_ptr<int32_t>()),         \
@@ -1679,7 +1849,7 @@ torch::Tensor sparse_int8_gemm(
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()),                \
             splitk_ws_ptr,                                                         \
             M, K, N_out,                                                           \
-            split_k, k_iters_per_split                                             \
+            split_k, k_iters_per_split, nullptr, 0                                 \
         );                                                                         \
     } while (0)
 
@@ -1723,16 +1893,19 @@ torch::Tensor sparse_int8_gemm(
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()),                          \
             splitk_ws_ptr,                                                                   \
             M, K, N_out,                                                                     \
-            split_k, k_iters_per_split                                                       \
+            split_k, k_iters_per_split, nullptr, 0                                           \
         );                                                                                   \
     } while (0)
 
     if (BW == 256) {
-        LAUNCH_SPARSE_GEMM(256, 128);
+        if (n_fastest) LAUNCH_SPARSE_GEMM(256, 128, true);
+        else           LAUNCH_SPARSE_GEMM(256, 128, false);
     } else if (BC == 128) {
-        LAUNCH_SPARSE_GEMM(128, 128);
+        if (n_fastest) LAUNCH_SPARSE_GEMM(128, 128, true);
+        else           LAUNCH_SPARSE_GEMM(128, 128, false);
     } else {
-        LAUNCH_SPARSE_GEMM(128, 64);
+        if (n_fastest) LAUNCH_SPARSE_GEMM(128, 64, true);
+        else           LAUNCH_SPARSE_GEMM(128, 64, false);
     }
 
     #undef LAUNCH_SPARSE_GEMM
@@ -1755,6 +1928,102 @@ torch::Tensor sparse_int8_gemm(
     return output;
 }
 
+// Fused quantize + sparse GEMM: 128-row weight tiles x 64-token activation blocks; each CTA
+// quantizes a block's fp16 rows into shared memory (full K resident) and runs every weight
+// tile against it, so the int8 activation never round-trips through DRAM.
+constexpr int SP_FQ_BW = 128, SP_FQ_BC = 64;
+
+static int sp_fq_smem_bytes(int K) {
+    return sp_fq_base_bytes<SP_FQ_BW, SP_FQ_BC>() + SP_FQ_BC * K + SP_FQ_BC * (int)sizeof(float);
+}
+
+// Fused path possible: the resident block fits (K <= 1280 on a 99 KB/block GPU).
+static bool sp_fq_fits(int K) {
+    return K <= sp_fq_vpt<SP_FQ_BC>() * 256
+        && sp_fq_smem_bytes(K) <= (int)at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+}
+
+// Path choice for the fp16-input layer. The two-kernel path writes an int8 copy of x and
+// the GEMM reads it back: nearly free while x and the copy (3*M*K bytes) stay in L2, 2*M*K
+// bytes of DRAM traffic once they do not (measured cut-over: between 83% and 94% of the
+// 72 MiB L2, which also holds weights and output; 90% used). The fused path saves that
+// traffic but runs the small 128x64 tile with the weights re-streamed from L2 per 64
+// tokens. Take it when the DRAM time saved (at ~0.92 TB/s, RTX 4090 copy bandwidth)
+// exceeds the cost-model penalty of the 128x64 tile vs the best two-kernel plan. Matches
+// the faster path on all 56 measured narrow/Hunyuan shapes (K 320..1280, N 256..10240,
+// M 768..147456). Narrow N_out at huge M takes it (1280->320 at M=147456); wide N_out
+// (640x5120, 1024x1280 at M=37k) and every shape whose activation fits L2 (all M <= 8192
+// headline shapes) stay on the two-kernel path.
+static bool sp_use_fused(int M, int K, int N_out) {
+    const auto* p = at::cuda::getCurrentDeviceProperties();
+    if (!sp_fq_fits(K)) return false;
+    if (3.0 * M * K <= 0.9 * (double)p->l2CacheSize) return false;
+    const int sms = p->multiProcessorCount;
+    const double fused = sp_plan(M, K, N_out, sms, 2, 1).cost;     // 128x64, no split
+    const double best  = sp_plan(M, K, N_out, sms, -1, -1).cost;
+    constexpr double kDramBytesPerMs = 0.92e9;
+    return fused - best < 2.0 * M * K / kDramBytesPerMs;
+}
+
+static torch::Tensor sparse_fq_launch(
+    const torch::Tensor& x, const torch::Tensor& w_comp, const torch::Tensor& w_meta,
+    const torch::Tensor& w_scale, const torch::Tensor& bias
+) {
+    constexpr int BW = SP_FQ_BW, BC = SP_FQ_BC;
+    const int M = x.size(0), K = x.size(1), N_out = w_comp.size(0);
+    TORCH_CHECK(sp_fq_fits(K), "fused sparse path: K=", K, " does not fit shared memory");
+    const auto* p = at::cuda::getCurrentDeviceProperties();
+    const int smem = sp_fq_smem_bytes(K);
+    static int smem_set = 0;   // max dynamic smem attribute set so far (raised on demand)
+    if (smem > smem_set) {
+        CHECK_CUDA(cudaFuncSetAttribute(sparse_gemm_fq_kernel<BW, BC>,
+                   cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        smem_set = smem;
+    }
+    auto output = torch::empty({M, N_out}, torch::dtype(torch::kFloat16).device(x.device()));
+    if (M == 0) return output;
+    const __half* bias_ptr = (bias.numel() > 0)
+        ? reinterpret_cast<const __half*>(bias.data_ptr<at::Half>()) : nullptr;
+    const int tiles = ((N_out + BW - 1) / BW) * ((M + BC - 1) / BC);
+    const int nctas = tiles < p->multiProcessorCount ? tiles : p->multiProcessorCount;
+    // Evict-first loads when x exceeds L2: it streams, and L2 is kept for the prefetched rows
+    const int x_stream = ((size_t)M * K * sizeof(__half) > (size_t)p->l2CacheSize) ? 1 : 0;
+    sparse_gemm_fq_kernel<BW, BC><<<nctas, SP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+        w_comp.data_ptr<int8_t>(), nullptr,
+        reinterpret_cast<const uint32_t*>(w_meta.data_ptr<int32_t>()),
+        nullptr,
+        reinterpret_cast<const __half*>(w_scale.data_ptr<at::Half>()),
+        bias_ptr,
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+        nullptr, M, K, N_out, 1, K / SP_BLOCK_K,
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()), x_stream);
+    CHECK_CUDA(cudaGetLastError());
+    return output;
+}
+
+// Full sparse INT8 linear with an explicit path: -1 = auto (sp_use_fused), 0 = quantize
+// kernel + sparse GEMM, 1 = fused quantize + GEMM. Outputs are bit-identical across paths.
+torch::Tensor sparse_int8_linear_ex(
+    torch::Tensor x, torch::Tensor w_comp, torch::Tensor w_meta, torch::Tensor w_scale,
+    torch::Tensor bias, int64_t path
+) {
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat16, "x must be fp16 CUDA");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D (M, K)");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(1) == 2 * w_comp.size(1), "x cols must be 2 * w_comp cols");
+    TORCH_CHECK(x.size(1) % 64 == 0, "K must be multiple of 64, got ", x.size(1));
+    TORCH_CHECK(w_comp.size(0) % 16 == 0, "N_out must be multiple of 16, got ", w_comp.size(0));
+    TORCH_CHECK(w_comp.is_contiguous() && w_meta.is_contiguous(), "weights must be contiguous");
+    const int M = x.size(0), K = x.size(1), N_out = w_comp.size(0);
+    // The fused kernel reads x with 16-byte vector loads (rows are 128-byte multiples)
+    const bool x_aligned = reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0;
+    TORCH_CHECK(path != 1 || x_aligned, "fused sparse path needs a 16-byte aligned x");
+    if (path == 1 || (path < 0 && M > 0 && x_aligned && sp_use_fused(M, K, N_out)))
+        return sparse_fq_launch(x, w_comp, w_meta, w_scale, bias);
+    auto q = sparse_quantize_act(x);
+    return sparse_int8_gemm(q[0], q[1], w_comp, w_meta, w_scale, bias, -1, -1, -1);
+}
+
 torch::Tensor sparse_int8_linear(
     torch::Tensor x,           // (M, K) fp16 activation
     torch::Tensor w_comp,      // (N_out, K/2) int8 compressed weight
@@ -1763,15 +2032,15 @@ torch::Tensor sparse_int8_linear(
     torch::Tensor bias         // (N_out,) fp16 or empty tensor
 ) {
     /*
-     * Full sparse INT8 linear: quantize activation -> sparse GEMM -> dequant + bias.
+     * Full sparse INT8 linear: quantize activation -> sparse GEMM -> dequant + bias
+     * (one fused kernel when that saves DRAM traffic, see sp_use_fused).
      * Returns output (M, N_out) fp16.
      */
     TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat16, "x must be fp16 CUDA");
     TORCH_CHECK(x.dim() == 2, "x must be 2D (M, K)");
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.size(1) == 2 * w_comp.size(1), "x cols must be 2 * w_comp cols");
-    auto q = sparse_quantize_act(x);
-    return sparse_int8_gemm(q[0], q[1], w_comp, w_meta, w_scale, bias, -1, -1);
+    return sparse_int8_linear_ex(x, w_comp, w_meta, w_scale, bias, -1);
 }
 
 // ===============================================================================
@@ -1791,7 +2060,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Sparse GEMM + dequant + bias on pre-quantized activations",
           py::arg("x_int8"), py::arg("act_scale"), py::arg("w_comp"), py::arg("w_meta"),
           py::arg("w_scale"), py::arg("bias"), py::arg("force_tile") = -1,
-          py::arg("force_split") = -1);
+          py::arg("force_split") = -1, py::arg("force_order") = -1);
+    m.def("sparse_int8_linear_ex", &sparse_int8_linear_ex,
+          "Sparse INT8 linear with an explicit path (-1 auto, 0 quantize + GEMM, 1 fused)",
+          py::arg("x"), py::arg("w_comp"), py::arg("w_meta"), py::arg("w_scale"), py::arg("bias"),
+          py::arg("path") = -1);
+    m.def("sparse_int8_linear_path", [](int64_t M, int64_t K, int64_t N_out) -> int64_t {
+              return sp_use_fused((int)M, (int)K, (int)N_out) ? 1 : 0; },
+          "Path sparse_int8_linear takes for a shape: 0 quantize + GEMM, 1 fused");
     m.def("test_mma_sp", &test_mma_sp,
           "Minimal mma.sp test: one 16x8 tile via m16n8k32 sparse INT8");
 }
