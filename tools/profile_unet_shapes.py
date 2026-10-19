@@ -2,9 +2,10 @@
 Profile sparse vs FP16 at exact UNet layer shapes and batch sizes.
 Identifies which layers contribute most to the overall speed gap.
 """
+import os
 import sys
 import time
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 
 import torch
 import torch.nn as nn

@@ -3,7 +3,7 @@ VRAM profiler for Hunyuan3D-2.1 texture pipeline.
 Logs GPU memory at each stage to find where the 14-18 GB of activations live.
 
 Usage:
-    python profile_vram.py
+    python tools/profile_vram.py
 """
 
 import os
@@ -11,7 +11,7 @@ import sys
 import time
 import torch
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
 
 # CUDA DLL directory

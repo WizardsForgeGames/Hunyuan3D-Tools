@@ -4,21 +4,22 @@ Benchmark: FP16 vs Sparse INT8 vs Dense TC INT8 vs bitsandbytes.
 Measures throughput, latency, VRAM, and correctness at UNet-relevant matrix sizes.
 
 Usage:
-    python benchmark.py
-    python benchmark.py --no-bnb       # skip bitsandbytes (if not installed)
-    python benchmark.py --no-sparse    # skip sparse INT8
-    python benchmark.py --shapes 1280  # only test layers with dim 1280
+    python tools/benchmark.py
+    python tools/benchmark.py --no-bnb       # skip bitsandbytes (if not installed)
+    python tools/benchmark.py --no-sparse    # skip sparse INT8
+    python tools/benchmark.py --shapes 1280  # only test layers with dim 1280
 """
 
 import argparse
 import gc
+import os
 import sys
 import time
 
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 from quantize_utils import Int8Linear, int_mm_available, sp_available
 
 

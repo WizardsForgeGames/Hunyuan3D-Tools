@@ -5,11 +5,11 @@ Creates a UNet2DConditionModel with the same config, applies quantization,
 measures VRAM, and runs a forward pass to verify correctness.
 
 Usage:
-    python test_sparse_unet.py
-    python test_sparse_unet.py --mode sparse       # 2:4 Sparse INT8 (default)
-    python test_sparse_unet.py --mode tensorcore    # Dense INT8 TC
-    python test_sparse_unet.py --mode fp16          # No quantization (baseline)
-    python test_sparse_unet.py --mode compare       # Run all three, compare VRAM + timing
+    python tools/test_sparse_unet.py
+    python tools/test_sparse_unet.py --mode sparse       # 2:4 Sparse INT8 (default)
+    python tools/test_sparse_unet.py --mode tensorcore    # Dense INT8 TC
+    python tools/test_sparse_unet.py --mode fp16          # No quantization (baseline)
+    python tools/test_sparse_unet.py --mode compare       # Run all three, compare VRAM + timing
 """
 
 import argparse
@@ -18,7 +18,7 @@ import os
 import sys
 import time
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 sys.path.insert(0, SCRIPT_DIR)
 
 import torch

@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
 
 # CUDA DLL

@@ -3,9 +3,10 @@ A/B test: all-sparse vs mixed-sparse vs FP16 on UNet.
 More iterations for stable timing.
 """
 import gc
+import os
 import sys
 import time
-sys.path.insert(0, ".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 
 import torch
 import torch.nn as nn
