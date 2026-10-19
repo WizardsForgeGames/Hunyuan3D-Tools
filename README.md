@@ -141,7 +141,7 @@ Custom CUDA kernels replace all Linear layers in the multiview UNet and DINOv2:
 # Tensorcore mode (default, recommended)
 python texture.py --mesh mesh.glb --image photo.png --quantize-mode tensorcore
 
-# Sparse mode (more aggressive, slight quality tradeoff)
+# Sparse mode (2:4 pruning without fine-tuning; quality cost not measured, check outputs)
 python texture.py --mesh mesh.glb --image photo.png --quantize-mode sparse
 ```
 
