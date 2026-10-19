@@ -286,9 +286,12 @@ class Int8Linear(nn.Module):
     # "tc" (default, auto-falls back to dequant at small M), "dequant", or "int_mm"
     mode: str = "tc"
 
-    # TC overhead isn't amortized below this M. Benchmarked: TC wins at M>=1024
-    # for most shapes, dequant is safer below that.
-    _TC_MIN_M: int = 768
+    # Below this M the TC kernel's fixed overhead dominates. Re-measured on an
+    # RTX 4090 (2026-10-19) at DINOv2-giant's 257 tokens: TC beats the dequant
+    # fallback on 1536x1536 (0.044 vs 0.077 ms) and 1536x8192 (0.077 vs 0.129 ms),
+    # ties on 4096x1536 and loses on 1536x4608 (0.172 vs 0.087 ms); net neutral
+    # per block. 256 lets DINOv2's layers use the TC kernel.
+    _TC_MIN_M: int = 256
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
