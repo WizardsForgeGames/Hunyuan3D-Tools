@@ -42,7 +42,7 @@ def main():
                         choices=["sparse", "tensorcore", "bnb", "none"],
                         help="Int8 quantization backend (default: tensorcore). "
                              "'sparse' uses 2:4 Sparse INT8 Tensor Cores (~69%% weight memory reduction), "
-                             "'tensorcore' uses custom Int8Linear (fused INT8 Tensor Core GEMM; weight memory about the same as FP16), "
+                             "'tensorcore' uses custom Int8Linear (fused INT8 Tensor Core GEMM, 50%% less weight memory), "
                              "'bnb' uses bitsandbytes, 'none' disables quantization.")
     parser.add_argument("--steps", type=int, default=15,
                         help="Denoising steps (default: 15, try 10 for speed)")

@@ -14,7 +14,7 @@ Four compute backends (auto-selected per layer):
      (FFN up-projections) by 1.1-1.3x. Requires K % 64 == 0, N % 16 == 0.
 
   3. "dequant" — Dequantize int8 weights to fp16 on-the-fly, then fp16
-     matmul. ~Same speed as nn.Linear; weight memory about the same as FP16 (stores two INT8 layouts).
+     matmul. ~Same speed as nn.Linear; 50% less weight memory than FP16.
      Used as fallback when TC requirements aren't met.
 
   4. "bnb" — bitsandbytes Linear8bitLt with mixed-precision decomposition.
@@ -152,10 +152,6 @@ class Int8Linear(nn.Module):
             "weight_int8_nk",
             torch.zeros(out_features, in_features, dtype=torch.int8),
         )
-        self.register_buffer(
-            "weight_int8_t",
-            torch.zeros(in_features, out_features, dtype=torch.int8),
-        )
         # Per-channel fp16 scale: (out_features,)
         self.register_buffer(
             "weight_scale",
@@ -186,9 +182,9 @@ class Int8Linear(nn.Module):
 
         weight_int8 = (weight_f32 / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
 
-        # Store both layouts
+        # One (N, K) copy. The int_mm and dequant paths read it through a
+        # transposed view, so no second (K, N) copy is stored.
         layer.weight_int8_nk = weight_int8.contiguous()          # (N, K)
-        layer.weight_int8_t = weight_int8.t().contiguous()        # (K, N)
         layer.weight_scale = scale.to(torch.float16)
 
         if has_bias:
@@ -226,7 +222,6 @@ class Int8Linear(nn.Module):
 
         # Free dense weight buffers (not needed in sparse mode)
         layer.register_buffer("weight_int8_nk", torch.empty(0, dtype=torch.int8))
-        layer.register_buffer("weight_int8_t", torch.empty(0, dtype=torch.int8))
 
         if has_bias:
             layer.bias = linear.bias.data.to(torch.float16)
@@ -276,7 +271,7 @@ class Int8Linear(nn.Module):
             x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
             act_scale = torch.nn.functional.pad(act_scale, (0, pad), value=1.0)
 
-        y_int32 = torch._int_mm(x_int8, self.weight_int8_t)
+        y_int32 = torch._int_mm(x_int8, self.weight_int8_nk.t())
         y = (y_int32.float() * (act_scale[:, None] * self.weight_scale[None, :].float())).half()
 
         if M < self._MIN_ROWS:
@@ -285,7 +280,7 @@ class Int8Linear(nn.Module):
 
     def _forward_dequant(self, x: torch.Tensor) -> torch.Tensor:
         """Fallback: dequantize int8 weights to fp16, then fp16 matmul."""
-        w_fp16 = self.weight_int8_t.to(torch.float16) * self.weight_scale[None, :]
+        w_fp16 = self.weight_int8_nk.t().to(torch.float16) * self.weight_scale[None, :]
         return torch.mm(x.to(torch.float16), w_fp16)
 
     # "tc" (default, auto-falls back to dequant at small M), "dequant", or "int_mm"
