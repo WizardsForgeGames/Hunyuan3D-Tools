@@ -4,8 +4,10 @@ Int8 quantization utilities for Hunyuan3D texture pipeline.
 Four compute backends (auto-selected per layer):
   1. "sparse" — 2:4 Sparse INT8 Tensor Core GEMM via PTX mma.sp.
      Prunes 50% of weights (2:4 pattern), compresses, and uses Sparse
-     Tensor Cores for 2x throughput. Requires K % 64 == 0, N % 16 == 0.
-     75% weight VRAM savings vs FP16 (50% quantization + 50% compression).
+     Tensor Cores. Requires K % 64 == 0, N % 16 == 0. Measured: 69% weight
+     memory reduction per layer vs FP16 (incl. metadata/scales) and
+     1.3-1.5x vs cuBLAS FP16 on large layers at M >= 4096. Dense INT8
+     (cuBLASLt) is faster in raw GEMM throughput.
 
   2. "tc" — Custom INT8 Tensor Core GEMM via wmma intrinsics. Fuses
      GEMM + dequant + bias in one kernel. Beats FP16 on wide layers

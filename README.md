@@ -1,10 +1,18 @@
 # Hunyuan3D-2.1 Optimized Pipeline Tools
 
-Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent/Hunyuan3D-2.1) on consumer GPUs. Full image-to-PBR-textured-3D pipeline in **~35s per model** on an RTX 4090 (texture only) or **~80s** end-to-end including shape generation.
+Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) on a single 24 GB consumer GPU. On an RTX 4090 24 GB:
+
+- **Texture stage: ~35 s per model** with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps.
+- **End-to-end: ~80 s per model** (shape ~45 s at 50 steps + texture ~35 s).
+- Model load is excluded from these numbers (amortized across the batch).
+
+**Context:** upstream Hunyuan3D-2.1 [documents 29 GB VRAM](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) for shape + texture generation; this pipeline runs both on a single 24 GB RTX 4090. For reference, a third-party RTX 4090 benchmark ([SaladCloud, Oct 2025](https://blog.salad.com/hunyuan3d-2-1/), ComfyUI custom node, settings not published) reported a 139 s median per generation. That is not a controlled comparison (different settings).
+
+**Status:** a personal tool built for my own projects, shared for anyone who finds it useful. It is not regularly maintained; I update it when I return to it.
 
 ![10 sample models generated with the optimized pipeline](screenshots/grid.png)
 
-*10 models generated end-to-end (image to textured PBR mesh) averaging ~35s texture time per model on RTX 4090.*
+*10 models generated end-to-end (image to textured PBR mesh) on an RTX 4090 24 GB. Texture stage averaged ~35 s per model at 10 denoising steps, INT8 tensorcore mode, 6 views at 512 px; shape stage ~45 s per model at 50 steps. Model load excluded.*
 
 ## What's Here
 
@@ -18,6 +26,11 @@ Wrapper scripts and custom CUDA kernels that optimize the Hunyuan3D-2.1 texture 
 | `batch_demo.py` | Full end-to-end: shape gen + batch texture for N models |
 | `quantize_utils.py` | INT8 quantization with custom Tensor Core GEMM kernels |
 | `csrc/` | CUDA kernels: INT8 TC GEMM (wmma), 2:4 Sparse TC GEMM (mma.sp) |
+| `generate.py` | One-shot CLI: image to mesh, optional `--texture` (uses the INT8 texture path) |
+| `start_server.py` / `client.py` | Launch the upstream Hunyuan3D API server (keeps models resident, default `127.0.0.1:8081`, `--low-vram` option) and send image requests to it |
+| `hy3d.bat` / `activate.bat` | Windows helpers: run `generate.py` with the local `venv`, or activate the `venv` |
+| `render_screenshots.py` / `repack_glb.py` | Render preview thumbnails/grid; re-export OBJ outputs as GLB with embedded metallic-roughness maps |
+| `tools/` | Development benchmarks, profilers and kernel tests (not needed to run the pipeline) |
 
 ## Quick Start
 
@@ -27,13 +40,13 @@ Wrapper scripts and custom CUDA kernels that optimize the Hunyuan3D-2.1 texture 
 - **CUDA Toolkit**: 12.6+
 - **PyTorch**: 2.8+ with cu126
 - **Python**: 3.11+
-- [Hunyuan3D-2.1](https://github.com/Tencent/Hunyuan3D-2.1) cloned as `./Hunyuan3D-2.1/`
+- [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) cloned as `./Hunyuan3D-2.1/`
 
 ### Installation
 
 ```bash
 # Clone Hunyuan3D-2.1 into this directory
-git clone https://github.com/Tencent/Hunyuan3D-2.1.git
+git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git
 
 # Install PyTorch 2.8+ with CUDA 12.6
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
@@ -83,6 +96,8 @@ python batch_demo.py --images img1.png img2.png img3.png
 
 Benchmarked on RTX 4090 24GB, PyTorch 2.8, CUDA 12.6, Windows 11.
 
+Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15), `--quantize-mode tensorcore`, 6 views at 512 px multiview resolution, 4096 px texture maps (views, resolution and texture size are the upstream defaults); shape 50 steps. Per-model times exclude model load, which is paid once per batch.
+
 ### Texture Generation (per model)
 
 | Step | Time | Notes |
@@ -120,7 +135,7 @@ Benchmarked on RTX 4090 24GB, PyTorch 2.8, CUDA 12.6, Windows 11.
 Custom CUDA kernels replace all Linear layers in the multiview UNet and DINOv2:
 
 - **Tensorcore mode**: Custom wmma INT8 GEMM kernel. Fuses GEMM + dequant + bias. 50% weight VRAM savings, ~1.0-1.3x FP16 speed.
-- **Sparse mode**: 2:4 structured sparsity + Sparse Tensor Cores via PTX `mma.sp`. 75% weight VRAM savings, 2x INT8 throughput on eligible layers.
+- **Sparse mode**: 2:4 structured sparsity + Sparse Tensor Cores via PTX `mma.sp`. Measured: 69% weight-memory reduction per layer vs FP16 and 1.3-1.5x vs cuBLAS FP16 on the large FFN layers at M >= 4096 (numbers in [sparsemma](https://github.com/WizardsForgeGames/sparsemma)). Dense INT8 (cuBLASLt) is faster in raw GEMM throughput; sparse mode trades that for memory.
 
 ```bash
 # Tensorcore mode (default, recommended)
@@ -154,8 +169,9 @@ Albedo and metallic-roughness texture inpainting run concurrently via ThreadPool
 | `int8_gemm_tc.cu` | Dense INT8 GEMM via wmma intrinsics (Tensor Cores) |
 | `int8_sparse_tc.cu` | 2:4 Sparse INT8 GEMM via PTX mma.sp (Sparse Tensor Cores) |
 | `int8_kernels.cu` | Activation quantization (fused per-row absmax + cast) |
-| `sparse_gemm.cu` | Sparse weight preprocessing and compression |
 | `build.py` | JIT compilation with ninja |
+
+These kernels are an earlier snapshot of the ones in [sparsemma](https://github.com/WizardsForgeGames/sparsemma), which has the current versions and benchmark numbers.
 
 Kernels are JIT-compiled on first use via `torch.utils.cpp_extension`. Requires CUDA Toolkit 12.6+ and a C++ compiler (MSVC on Windows, gcc on Linux).
 
@@ -194,4 +210,10 @@ huggingface_hub
 
 ## License
 
-These tools are provided for research and non-commercial use, consistent with the [Tencent Hunyuan Non-Commercial License](https://github.com/Tencent/Hunyuan3D-2.1/blob/main/LICENSE) of the underlying Hunyuan3D-2.1 model.
+The code in this repository (scripts and `csrc/` kernels) is released under the [MIT License](LICENSE), Copyright (c) 2026 Darren Sander.
+
+The Hunyuan3D-2.1 model, weights and upstream code are not covered by that license. They remain under Tencent's [Hunyuan 3D 2.1 Community License](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/blob/main/LICENSE), which governs what you can do with the model and its outputs. Using these tools with the model is intended for research and non-commercial use, consistent with that license.
+
+---
+
+If you found this useful, you can [buy me a coffee](https://ko-fi.com/thewizardsforge).

@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--quantize-mode", default="tensorcore",
                         choices=["sparse", "tensorcore", "bnb", "none"],
                         help="Int8 quantization backend (default: tensorcore). "
-                             "'sparse' uses 2:4 Sparse INT8 Tensor Cores (75%% weight VRAM savings), "
+                             "'sparse' uses 2:4 Sparse INT8 Tensor Cores (~69%% weight memory reduction), "
                              "'tensorcore' uses custom Int8Linear (50%% weight VRAM savings), "
                              "'bnb' uses bitsandbytes, 'none' disables quantization.")
     parser.add_argument("--steps", type=int, default=15,
