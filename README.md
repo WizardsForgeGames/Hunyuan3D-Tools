@@ -207,6 +207,8 @@ huggingface_hub
 
 ## Known Issues
 
+**If a kernel fails to build**, `Int8Linear` falls back to a slower path and prints a boxed warning naming the kernel and the error (once per process). Set `INT8_KERNELS_STRICT=1` to make that an error instead. On Windows with a non-UTF-8 code page, older PyTorch versions can fail to read kernel sources; the sources are ASCII-only for that reason, and `PYTHONUTF8=1` also avoids it.
+
 - **Intermittent CUDA slowdowns**: 1-2 out of 10 models may experience 2-5x slower denoising in batch mode. Re-running typically resolves it. Caused by PyTorch CUDA allocator behavior under sustained load.
 - **PyTorch 2.8 torch.load corruption**: Intermittent `PytorchStreamReader` errors. Mitigated by `mmap=False` monkey-patch and retry logic.
 - **Windows path separator**: Batch mode uses `|` as pair separator (not `:`) to avoid conflicts with Windows drive letters.

@@ -34,6 +34,27 @@ Usage:
 import torch
 import torch.nn as nn
 
+import os
+import sys
+import warnings
+
+# Set INT8_KERNELS_STRICT=1 to raise instead of falling back when a kernel fails to build.
+_STRICT = os.environ.get("INT8_KERNELS_STRICT", "") not in ("", "0")
+_FAILED = object()  # cached load failure, so a failed build is attempted only once
+
+
+def _kernel_unavailable(name, fallback, err):
+    msg = (f"{name} kernel failed to build or load; falling back to {fallback}. "
+           f"Error: {type(err).__name__}: {err}. "
+           "On Windows with a non-UTF-8 code page, setting PYTHONUTF8=1 may help. "
+           "Set INT8_KERNELS_STRICT=1 to make this an error.")
+    if _STRICT:
+        raise RuntimeError(msg) from err
+    banner = "!" * 78
+    print(banner, "  WARNING: " + msg, banner, sep="\n", file=sys.stderr, flush=True)
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Custom TC GEMM module (lazy-loaded)
@@ -45,6 +66,8 @@ _TC_MODULE = None
 def _load_tc():
     """Lazy-load the custom Tensor Core INT8 GEMM extension."""
     global _TC_MODULE
+    if _TC_MODULE is _FAILED:
+        return None
     if _TC_MODULE is not None:
         return _TC_MODULE
     try:
@@ -52,7 +75,8 @@ def _load_tc():
         _TC_MODULE = load_tc_gemm()
         return _TC_MODULE
     except Exception as e:
-        print(f"  Warning: TC GEMM compilation failed ({e}), using dequant fallback")
+        _TC_MODULE = _FAILED
+        _kernel_unavailable("Dense INT8 Tensor Core GEMM (int8_gemm_tc)", "the dequantize + FP16 matmul path", e)
         return None
 
 
@@ -71,6 +95,8 @@ _SP_MODULE = None
 def _load_sp():
     """Lazy-load the sparse INT8 Tensor Core GEMM extension (PTX mma.sp)."""
     global _SP_MODULE
+    if _SP_MODULE is _FAILED:
+        return None
     if _SP_MODULE is not None:
         return _SP_MODULE
     try:
@@ -78,7 +104,8 @@ def _load_sp():
         _SP_MODULE = load_sparse_tc()
         return _SP_MODULE
     except Exception as e:
-        print(f"  Warning: Sparse TC compilation failed ({e}), using dense fallback")
+        _SP_MODULE = _FAILED
+        _kernel_unavailable("Sparse INT8 Tensor Core GEMM (int8_sparse_tc)", "the dense path", e)
         return None
 
 
