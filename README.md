@@ -4,7 +4,7 @@ Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan
 
 - **Texture stage: ~23 s per model** (22-24 s) with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps. Remesh and UV unwrap run on a CPU worker while the GPU textures the previous mesh.
 - **End-to-end: ~63 s per model** (shape ~40 s at 50 steps + texture ~23 s), vs ~80 s in February 2026.
-- Model load is excluded from these numbers; `batch_demo.py` loads the shape and texture models once per batch each. A 5-model batch takes {TOTAL} wall time (see [Performance](#performance)).
+- Model load is excluded from these numbers; `batch_demo.py` loads the shape and texture models once per batch each. A 5-model batch takes 402.3 s wall time (see [Performance](#performance)).
 - Earlier the same day the February figures did not reproduce (~48 s texture, ~92 s end-to-end): Windows was running the CPU stages on the E-cores. The scripts now opt out of that; see [Performance](#performance).
 
 **Context:** upstream Hunyuan3D-2.1 [documents 29 GB VRAM](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) for shape + texture generation; this pipeline runs both on a single 24 GB RTX 4090 (measured peaks: 8.5 GiB reserved for shape, 19.0 GiB reserved / 11.0 GiB allocated for texture, in separate processes; see [GPU memory](#gpu-memory)). For reference, a third-party RTX 4090 benchmark ([SaladCloud, Oct 2025](https://blog.salad.com/hunyuan3d-2-1/), ComfyUI custom node, settings not published) reported a 139 s median per generation. That is not a controlled comparison (different settings).
@@ -162,9 +162,9 @@ With the prefetch worker no model waits for its mesh, the first one included (it
 
 | Phase | 2026-10-20 |
 |-------|------------|
-| Shape phase (one process: start-up, one model load, 5 x ~39.7 s) | {SHAPE} |
-| Texture phase (process start, pipeline load ~13 s, quantization, 5 x ~23 s) | {TEX} |
-| **Total wall time** | **{TOTAL}** |
+| Shape phase (one process: start-up, one model load, 5 x ~39.7 s) | 243.1 s |
+| Texture phase (process start, pipeline load ~13 s, quantization, 5 x ~23 s) | 159.2 s (this run included one `torch.load` retry) |
+| **Total wall time** | **402.3 s** (973 s earlier the same day, before these fixes) |
 | **Per model, generation only (shape + texture, model load excluded)** | **~63 s** (Feb 2026: ~80 s) |
 
 The February table gave ~7.5 min for 10 shapes, which is 10 x 45 s of generation only; at the time `batch_demo.py` also reloaded the shape model in a new process for every image, which the table did not count.
