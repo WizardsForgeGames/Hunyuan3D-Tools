@@ -2,10 +2,10 @@
 
 Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) on a single 24 GB consumer GPU. On an RTX 4090 24 GB (measured 2026-10-20, PyTorch 2.8.0+cu126, 5 sample images):
 
-- **Texture stage: ~48 s per model** (44-53 s) with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps. About 26 s of that is CPU work (remesh, UV unwrap, seam inpainting).
-- **End-to-end: ~92 s per model** (shape ~44 s at 50 steps + texture ~48 s).
-- Model load is excluded from these numbers. The texture models load once per batch; `batch_demo.py` loads the shape model again for every image (see [Performance](#performance)).
-- The February 2026 figures (~35 s texture, ~80 s end-to-end) did not reproduce in this measurement. PyTorch is not the cause (2.5.1 and 2.8.0 measure the same); see [Performance](#performance).
+- **Texture stage: ~23 s per model** (22-24 s) with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps. Remesh and UV unwrap run on a CPU worker while the GPU textures the previous mesh.
+- **End-to-end: ~63 s per model** (shape ~40 s at 50 steps + texture ~23 s), vs ~80 s in February 2026.
+- Model load is excluded from these numbers; `batch_demo.py` loads the shape and texture models once per batch each. A 5-model batch takes {TOTAL} wall time (see [Performance](#performance)).
+- Earlier the same day the February figures did not reproduce (~48 s texture, ~92 s end-to-end): Windows was running the CPU stages on the E-cores. The scripts now opt out of that; see [Performance](#performance).
 
 **Context:** upstream Hunyuan3D-2.1 [documents 29 GB VRAM](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) for shape + texture generation; this pipeline runs both on a single 24 GB RTX 4090 (measured peaks: 8.5 GiB reserved for shape, 19.0 GiB reserved / 11.0 GiB allocated for texture, in separate processes; see [GPU memory](#gpu-memory)). For reference, a third-party RTX 4090 benchmark ([SaladCloud, Oct 2025](https://blog.salad.com/hunyuan3d-2-1/), ComfyUI custom node, settings not published) reported a 139 s median per generation. That is not a controlled comparison (different settings).
 
@@ -23,6 +23,8 @@ Wrapper scripts and custom CUDA kernels that optimize the Hunyuan3D-2.1 texture 
 |-----------|-------------|
 | `texture.py` | Single-model texture generation with all optimizations |
 | `texture_batch.py` | Batch texture generation (load pipeline once, texture many) |
+| `mesh_prep.py` | Remesh + UV unwrap in a background worker process, ahead of the texture pipeline |
+| `win_qos.py` | Opts the process out of Windows power throttling so CPU stages run on P-cores |
 | `generate_shape.py` | Image-to-mesh shape generation |
 | `batch_demo.py` | Full end-to-end: shape gen + batch texture for N models |
 | `quantize_utils.py` | INT8 quantization with custom Tensor Core GEMM kernels |
@@ -126,50 +128,50 @@ python batch_demo.py --images img1.png img2.png img3.png
 
 ## Performance
 
-**Measured 2026-10-20.** RTX 4090 24 GB (driver 617.14), i9-13900K, Windows 11, Python 3.11.3, PyTorch 2.8.0+cu126 / torchvision 0.23.0+cu126, packages from `requirements-cu126.txt`, kernels built with the CUDA 12.4 toolkit. Desktop applications were open (2.2-4.6 GB of VRAM in use before the runs).
+**Measured 2026-10-20.** RTX 4090 24 GB (driver 617.14), i9-13900K (8 P + 16 E cores), Windows 11, Python 3.11.3, `venv-cu126`: PyTorch 2.8.0+cu126 / torchvision 0.23.0+cu126, packages from `requirements-cu126.txt`, kernels built with the CUDA 12.4 toolkit. Desktop applications were open (2.2-4.6 GB of VRAM in use before the runs). On this hybrid CPU, Windows 11 schedules a process started without a foreground window (background shell, IDE task) on the E-cores, which made the CPU stages 1.3-1.6x slower; every entry script now opts out of that power throttling for its own process (`win_qos.py`), and that was the gap to the February numbers.
 
-Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15), `--quantize-mode tensorcore` unless noted, 6 views at 512 px multiview resolution, 4096 px texture maps (views, resolution and texture size are the upstream defaults); shape 50 steps. Inputs: the first 5 `batch_demo.py` sample images (`ainimal_9`, `ainimal_14`, `004`, `073`, `202`), run as `python batch_demo.py --num 5 --texture-steps 10`. Tensorcore numbers pool two batch runs (10 textures); sparse is one run (`--skip-shape --quantize-mode sparse`, same meshes). Per-model times exclude model load.
+Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15), `--quantize-mode tensorcore`, 6 views at 512 px multiview resolution, 4096 px texture maps (views, resolution and texture size are the upstream defaults); shape 50 steps. Inputs: the first 5 `batch_demo.py` sample images (`ainimal_9`, `ainimal_14`, `004`, `073`, `202`). Per-stage texture times pool two `texture_batch.py` runs per mode (10 textures each) on the meshes of one batch; per-model times exclude model load.
 
 ### Texture Generation (per model)
 
-| Step | Feb 2026 | 2026-10-20 tensorcore, median (range) | 2026-10-20 sparse, median |
-|------|----------|----------------------------------------|---------------------------|
-| Remesh (pymeshlab, CPU) | 4-9 s | 8.2 s (4.9-13.5) | 8.9 s |
-| UV unwrap (xatlas, CPU) | 3-6 s | 5.2 s (3.8-7.1) | 5.2 s |
-| Load mesh, select views, render normal/position maps | not listed | 1.4 s | 1.5 s |
-| Multiview denoising (10 steps, INT8 UNet) | 9-17 s | 9.9 s (8.8-12.6) | 8.8 s (8.6-9.4) |
-| RealESRGAN enhance (GPU) | 4 s | 5.2 s (4.5-8.6) | 4.8 s |
-| Texture baking (GPU) | 2-3 s | 2.9 s (2.6-3.2) | 2.7 s |
-| Inpainting (CPU, TELEA, albedo and MR in parallel) | 7-8 s | 12.6 s (11.7-15.2) | 12.7 s |
-| Save + GLB convert | 1 s | 1.1 s | 1.1 s |
-| **Total per model** | **~35 s** | **48.2 s mean (44.6-53.3)** | **46.1 s mean (43.6-49.8)** |
-| Pipeline load (once per batch) | ~14 s | 20-25 s | 21 s |
+| Step | Feb 2026 | 2026-10-20, median (range) |
+|------|----------|----------------------------|
+| Remesh (pymeshlab, CPU) | 4-9 s | 5.0 s (3.2-7.0), on a background worker: overlapped with the GPU stages |
+| UV unwrap (xatlas, CPU) | 3-6 s | 4.0 s (2.9-4.5), on the same worker: overlapped |
+| Load mesh, select views, render normal/position maps | not listed | 0.9 s |
+| Multiview denoising (10 steps, INT8 UNet) | 9-17 s | 8.5 s (8.5-8.6) |
+| RealESRGAN enhance (GPU) | 4 s | 3.7 s |
+| Texture baking (GPU) | 2-3 s | 1.7 s |
+| Inpainting (CPU, TELEA, albedo and MR in parallel) | 7-8 s | 7.1 s (6.8-8.9) |
+| Save + GLB convert | 1 s | 0.5 s |
+| **Total per model** | **~35 s** | **23.0 s mean (22.2-24.2)**; 32.1 s (30.2-34.6) with `--no-prefetch` |
+| Pipeline load (once per batch) | ~14 s | 12.7-14.1 s |
 
-The first texture run in a fresh environment also compiles the INT8 kernels (about 40 s, once; cached under `torch_extensions`).
+With the prefetch worker no model waits for its mesh, the first one included (its remesh runs during the pipeline load). Outputs are identical with and without prefetch (geometry, UVs and all texture images). The first texture run in a fresh environment also compiles the INT8 kernels (about 40 s, once; cached under `torch_extensions`).
 
 ### Shape Generation
 
 | Metric | Feb 2026 | 2026-10-20 |
 |--------|----------|------------|
-| Per model (50 steps) | ~45 s | 44.0 s mean (41.7-48.8) |
-| Model load | ~30 s | ~42 s (85 s cold, first run) |
-
-`batch_demo.py` runs each shape job in its own process, so the shape model load (plus ~15 s of process start and imports) is paid for every image, not once per batch.
+| Per model (50 steps) | ~45 s | 39.7 s (39.6-39.9) |
+| Model load | ~30 s | 23.6-34.8 s, once per batch |
 
 ### End-to-End (5 Models, Batch)
 
+`python batch_demo.py --num 5 --texture-steps 10`:
+
 | Phase | 2026-10-20 |
 |-------|------------|
-| Shape phase (5 models, including per-image process start and model load) | ~626 s (~125 s per image) |
-| Texture phase (process start, pipeline load 25 s, quantization + one-time kernel build 62 s, 5 x ~50 s) | ~347 s |
-| **Total wall time** | **973 s (16.2 min)** |
-| Per model, generation only (shape + texture, model load excluded) | ~92 s |
+| Shape phase (one process: start-up, one model load, 5 x ~39.7 s) | {SHAPE} |
+| Texture phase (process start, pipeline load ~13 s, quantization, 5 x ~23 s) | {TEX} |
+| **Total wall time** | **{TOTAL}** |
+| **Per model, generation only (shape + texture, model load excluded)** | **~63 s** (Feb 2026: ~80 s) |
 
-The February table gave ~7.5 min for 10 shapes, which is 10 x 45 s of generation only; it did not count the per-image model load.
+The February table gave ~7.5 min for 10 shapes, which is 10 x 45 s of generation only; at the time `batch_demo.py` also reloaded the shape model in a new process for every image, which the table did not count.
 
 ### GPU Memory
 
-Peaks per stage from `torch.cuda.max_memory_allocated()` / `max_memory_reserved()` (reset at each stage boundary; GiB), same runs as above:
+Peaks per stage from `torch.cuda.max_memory_allocated()` / `max_memory_reserved()` (reset at each stage boundary; GiB), from 5-model batch runs (re-checked with mesh prefetch and the single shape process: unchanged):
 
 | Stage | Peak allocated | Peak reserved |
 |-------|----------------|---------------|
@@ -177,16 +179,14 @@ Peaks per stage from `torch.cuda.max_memory_allocated()` / `max_memory_reserved(
 | Texture: models resident between stages (after INT8 quantization, DINOv2 on CPU) | 4.9 GiB | - |
 | Texture: multiview denoising, tensorcore | 11.0 GiB | 19.0 GiB |
 | Texture: multiview denoising, sparse | 10.7 GiB | 17.9 GiB |
-| Texture: baking | 8.5 GiB | 9.8 GiB |
+| Texture: baking | 8.5 GiB | 9.9 GiB |
 | Whole GPU (`nvidia-smi`, including ~2.2-4.6 GB used by the desktop) | 21.4 GiB max | |
 
 How it fits in 24 GB: shape and texture never share a process, so their peaks do not add; the UNet and DINOv2 Linear weights are INT8; DINOv2 moves to the CPU after it runs. During denoising the allocator caches up to 19 GiB while about 11 GiB is in use; `empty_cache()` before RealESRGAN returns it.
 
-### PyTorch 2.5.1 vs 2.8.0, and the February numbers
+### History: the earlier 2026-10-20 measurement
 
-Same day, same 5 images, in a second environment with torch 2.5.1+cu124 and the upstream Hunyuan3D-2.1 pins (diffusers 0.30.0, transformers 4.46.0): shape 42.3 s, texture 48.9 s mean (43.5-53.8), total wall 890 s. That matches PyTorch 2.8.0 within run-to-run variation, so the PyTorch version does not explain the gap to the February numbers.
-
-The February environment was not recorded. Package install dates and build caches on the machine indicate the system Python 3.11 with torch 2.8.0+cu126 in user site-packages, pymeshlab 2025.7 and opencv 4.13 (this environment: pymeshlab 2022.2, opencv 4.11). Those library versions were checked directly and do not explain it either: remeshing a 596k-face mesh to 40k faces took 4.8-5.3 s with pymeshlab 2022.2 vs 5.6-5.9 s with 2025.7, and `cv2.inpaint` (TELEA, 4096 px) 6.3-6.5 s with opencv 4.11 vs 6.4-6.6 s with 4.13. Most of the difference is in CPU stages, mainly inpainting (12.6 s vs 7-8 s; in a profiled run it is two concurrent `cv2.inpaint` calls of ~9.9 s each on 4096 px textures). The cause is not identified.
+The same day, before the power-throttling opt-out, the single shape-model load and mesh prefetch, the same 5 images measured: texture 48.2 s mean (44.6-53.3; remesh 8.2 s, UV 5.2 s, inpainting 12.6 s, denoising 9.9 s), pipeline load 20-25 s, shape 44.0 s, ~92 s per model generation only, and a 973 s batch (626 s of it the shape phase, with one process and model load per image). Sparse mode measured 46.1 s per texture in that setup. A second environment with torch 2.5.1+cu124 and the upstream Hunyuan3D-2.1 pins (diffusers 0.30.0, transformers 4.46.0) measured the same (shape 42.3 s, texture 48.9 s), so the PyTorch version was not the cause, and the library versions in the February environment (pymeshlab 2025.7, opencv 4.13) were checked directly and did not explain it either. The cause was the E-core scheduling described above: two concurrent 4096 px `cv2.inpaint` calls took 7.1-7.4 s pinned to the P-cores, 11.8-12.6 s pinned to the E-cores, and 7.4-7.8 s with the opt-out.
 
 ## Optimizations
 
@@ -218,7 +218,15 @@ Albedo and metallic-roughness texture inpainting run concurrently via ThreadPool
 
 ### Batch Pipeline Loading
 
-`texture_batch.py` loads the ~2GB texture pipeline once and processes all meshes sequentially, saving the pipeline load (20-25 s measured 2026-10-20; ~14 s in February) plus quantization for each additional model vs individual `texture.py` calls.
+`texture_batch.py` loads the ~2GB texture pipeline once and processes all meshes sequentially, saving the pipeline load (12.7-14.1 s measured 2026-10-20; ~14 s in February) plus quantization for each additional model vs individual `texture.py` calls. `batch_demo.py` likewise generates all shapes in one process after a single shape-model load (`generate_shape.py --pairs "image|output" ...`).
+
+### Mesh Prefetch (`mesh_prep.py`)
+
+Remeshing and UV unwrapping (~9 s of CPU work per model) depend only on the input mesh. A worker process runs the same upstream functions ahead of time: `texture.py` overlaps them with the pipeline load, and `texture_batch.py` prepares mesh N+1 while mesh N is textured on the GPU. The pipeline takes the prepared mesh via `mesh=` and skips both steps. 32.1 -> 23.0 s per model, identical output; `--no-prefetch` restores the in-pipeline path.
+
+### Windows Power Throttling Opt-out (`win_qos.py`)
+
+Each entry script calls `SetProcessInformation(ProcessPowerThrottling)` for its own process (no system or power-plan change; no-op off Windows), so Windows 11 does not move it to the E-cores when it was started without a foreground window. Texture time per model: 47.0 -> 31.7 s mean before prefetch, with byte-identical outputs.
 
 ### Load Workarounds
 
