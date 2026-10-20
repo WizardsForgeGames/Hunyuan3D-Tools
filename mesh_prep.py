@@ -16,7 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
@@ -48,18 +48,36 @@ def prepare_mesh(mesh_path, use_remesh=True):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+class _Pending:
+    """Handle for one submitted mesh; result() waits for it (Future-like)."""
+
+    def __init__(self, async_result):
+        self._r = async_result
+
+    def result(self, timeout=None):
+        return self._r.get(timeout)
+
+
 class MeshPrefetcher:
-    """One worker process that prepares meshes in the background, in submission order."""
+    """One worker process that prepares meshes in the background, in submission order.
+
+    Uses a multiprocessing.Pool, not a ProcessPoolExecutor: Pool workers are daemon
+    processes that are terminated when the caller exits, whereas concurrent.futures
+    waits at interpreter exit for every queued mesh. If the caller fails (e.g. a
+    torch.load error while the pipeline loads) that wait delayed its exit, and
+    batch_demo.py's retry, by ~9 s per queued mesh.
+    """
 
     def __init__(self):
-        self._pool = ProcessPoolExecutor(max_workers=1, initializer=_init_worker)
+        self._pool = multiprocessing.get_context("spawn").Pool(1, initializer=_init_worker)
 
     def submit(self, mesh_path, use_remesh=True):
-        """Start preparing `mesh_path`; returns a Future whose result() is the trimesh."""
-        return self._pool.submit(prepare_mesh, mesh_path, use_remesh)
+        """Start preparing `mesh_path`; returns a handle whose result() is the trimesh."""
+        return _Pending(self._pool.apply_async(prepare_mesh, (mesh_path, use_remesh)))
 
     def close(self):
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        """Stop now: drop queued meshes and kill a mesh in progress."""
+        self._pool.terminate()
 
     def __enter__(self):
         return self
