@@ -91,6 +91,12 @@ def main():
 
     t0 = time.time()
 
+    # Remesh + UV-unwrap in a background process while the models load (CPU work that
+    # only needs the mesh; identical result, see mesh_prep.py)
+    from mesh_prep import MeshPrefetcher
+    prefetcher = MeshPrefetcher()
+    prepared = prefetcher.submit(args.mesh)
+
     from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
     conf = Hunyuan3DPaintConfig(args.views, args.resolution)
@@ -141,10 +147,17 @@ def main():
         )
 
     print("Generating textures...")
+    try:
+        mesh_obj = prepared.result()
+    except Exception as e:
+        print(f"  (background remesh/UV failed: {e}; redoing it in the pipeline)")
+        mesh_obj = None
+    prefetcher.close()
     paint_pipeline(
         mesh_path=args.mesh,
         image_path=args.image,
         output_mesh_path=args.output,
+        mesh=mesh_obj,
     )
 
     tex_time = time.time() - t0

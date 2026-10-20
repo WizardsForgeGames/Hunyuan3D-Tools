@@ -535,7 +535,7 @@ index 871dae5..b3c1b5c 100644
                  prompt, device=device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False
              )
 diff --git a/hy3dpaint/textureGenPipeline.py b/hy3dpaint/textureGenPipeline.py
-index a582892..75a17a6 100644
+index a582892..c9a49db 100644
 --- a/hy3dpaint/textureGenPipeline.py
 +++ b/hy3dpaint/textureGenPipeline.py
 @@ -52,6 +52,7 @@ class Hunyuan3DPaintConfig:
@@ -546,10 +546,19 @@ index a582892..75a17a6 100644
  
          # view selection
          self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
-@@ -92,6 +93,12 @@ class Hunyuan3DPaintPipeline:
+@@ -90,8 +91,19 @@ class Hunyuan3DPaintPipeline:
+         print("Models Loaded.")
+ 
      @torch.no_grad()
-     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
-         """Generate texture for 3D mesh using multiview diffusion"""
+-    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
+-        """Generate texture for 3D mesh using multiview diffusion"""
++    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True,
++                 mesh=None):
++        """Generate texture for 3D mesh using multiview diffusion.
++
++        mesh: optional trimesh that is already remeshed and UV-unwrapped (prepared ahead of
++        time, e.g. in a worker process while models load); remesh and UV unwrap are skipped.
++        """
 +        import time as _time
 +        _t0 = _time.time()
 +        def _log(msg):
@@ -559,21 +568,31 @@ index a582892..75a17a6 100644
          # Ensure image_prompt is a list
          if isinstance(image_path, str):
              image_prompt = Image.open(image_path)
-@@ -106,6 +113,7 @@ class Hunyuan3DPaintPipeline:
+@@ -104,8 +116,11 @@ class Hunyuan3DPaintPipeline:
+ 
+         # Process mesh
          path = os.path.dirname(mesh_path)
-         if use_remesh:
+-        if use_remesh:
++        if mesh is not None:
++            processed_mesh_path = None
++        elif use_remesh:
              processed_mesh_path = os.path.join(path, "white_mesh_remesh.obj")
 +            _log("Remeshing...")
              remesh_mesh(mesh_path, processed_mesh_path)
          else:
              processed_mesh_path = mesh_path
-@@ -115,11 +123,14 @@ class Hunyuan3DPaintPipeline:
+@@ -115,11 +130,17 @@ class Hunyuan3DPaintPipeline:
              output_mesh_path = os.path.join(path, f"textured_mesh.obj")
  
          # Load mesh
-+        _log("UV unwrapping...")
-         mesh = trimesh.load(processed_mesh_path)
-         mesh = mesh_uv_wrap(mesh)
+-        mesh = trimesh.load(processed_mesh_path)
+-        mesh = mesh_uv_wrap(mesh)
++        if mesh is None:
++            _log("UV unwrapping...")
++            mesh = trimesh.load(processed_mesh_path)
++            mesh = mesh_uv_wrap(mesh)
++        else:
++            _log("Using pre-processed mesh (remeshed + UV-unwrapped ahead of time)")
 +        _log("Loading mesh into renderer...")
          self.render.load_mesh(mesh=mesh)
  
@@ -582,7 +601,7 @@ index a582892..75a17a6 100644
          selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
              self.config.candidate_camera_elevs,
              self.config.candidate_camera_azims,
-@@ -127,9 +138,11 @@ class Hunyuan3DPaintPipeline:
+@@ -127,9 +148,11 @@ class Hunyuan3DPaintPipeline:
              self.config.max_selected_view_num,
          )
  
@@ -594,7 +613,7 @@ index a582892..75a17a6 100644
          position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
  
          ##########  Style  ###########
-@@ -145,24 +158,34 @@ class Hunyuan3DPaintPipeline:
+@@ -145,24 +168,34 @@ class Hunyuan3DPaintPipeline:
          image_style = [image.convert("RGB") for image in image_style]
  
          ###########  Multiview  ##########
@@ -632,7 +651,7 @@ index a582892..75a17a6 100644
              enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
                  (self.config.render_size, self.config.render_size)
              )
-@@ -177,16 +200,25 @@ class Hunyuan3DPaintPipeline:
+@@ -177,16 +210,25 @@ class Hunyuan3DPaintPipeline:
          mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
  
          ##########  inpaint  ###########

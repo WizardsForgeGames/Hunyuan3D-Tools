@@ -42,7 +42,7 @@ sys.path.append(os.path.join(REPO_DIR, "hy3dpaint", "custom_rasterizer"))
 def main():
     parser = argparse.ArgumentParser(description="Batch texture generation")
     parser.add_argument("--pairs", nargs="+", default=None,
-                        help="mesh:image pairs (e.g. mesh.glb:photo.png)")
+                        help="mesh|image pairs (e.g. \"mesh.glb|photo.png\" - quote it; from Git Bash set MSYS_NO_PATHCONV=1)")
     parser.add_argument("--mesh-dir", default=None,
                         help="Directory of *_mesh.glb files to texture")
     parser.add_argument("--image-dir", default=None,
@@ -56,6 +56,8 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--views", type=int, default=6)
     parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--no-prefetch", action="store_true",
+                        help="Remesh + UV-unwrap inside the pipeline instead of in a background worker")
     args = parser.parse_args()
 
     # Apply torchvision compatibility fix
@@ -115,6 +117,16 @@ def main():
     print(f"Batch texture: {n} models, {args.steps} steps, quantize={args.quantize_mode}")
     print()
 
+    # Remesh + UV-unwrap every mesh in a background process (CPU), in order, while the
+    # pipeline loads and earlier meshes are textured on the GPU. Same functions as the
+    # pipeline runs itself, so the result is identical (see mesh_prep.py).
+    prefetcher = None
+    prepared = [None] * n
+    if not args.no_prefetch:
+        from mesh_prep import MeshPrefetcher
+        prefetcher = MeshPrefetcher()
+        prepared = [prefetcher.submit(mesh) for mesh, _, _ in pairs]
+
     # Load pipeline ONCE
     from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
@@ -165,10 +177,17 @@ def main():
         print(f"[{idx+1}/{n}] {name}")
         t0 = time.time()
         try:
+            mesh_obj = None
+            if prepared[idx] is not None:
+                try:
+                    mesh_obj = prepared[idx].result()  # waiting time counts toward this model
+                except Exception as e:
+                    print(f"  (background remesh/UV failed: {e}; redoing it in the pipeline)")
             paint_pipeline(
                 mesh_path=mesh,
                 image_path=image,
                 output_mesh_path=output,
+                mesh=mesh_obj,
             )
             t = time.time() - t0
             times.append(t)
@@ -179,6 +198,9 @@ def main():
             times.append(-1)
             print(f"  -> FAILED ({t:.1f}s): {e}")
         print()
+
+    if prefetcher is not None:
+        prefetcher.close()
 
     # Summary
     valid = [t for t in times if t > 0]
