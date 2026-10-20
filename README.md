@@ -1,18 +1,19 @@
 # Hunyuan3D-2.1 Optimized Pipeline Tools
 
-Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) on a single 24 GB consumer GPU. On an RTX 4090 24 GB:
+Performance-tuned tooling for [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) on a single 24 GB consumer GPU. On an RTX 4090 24 GB (measured 2026-10-20, PyTorch 2.8.0+cu126, 5 sample images):
 
-- **Texture stage: ~35 s per model** with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps.
-- **End-to-end: ~80 s per model** (shape ~45 s at 50 steps + texture ~35 s).
-- Model load is excluded from these numbers (amortized across the batch).
+- **Texture stage: ~48 s per model** (44-53 s) with 10 denoising steps (upstream default is 15), INT8 tensorcore mode, 6 views at 512 px, 4096 px texture maps. About 26 s of that is CPU work (remesh, UV unwrap, seam inpainting).
+- **End-to-end: ~92 s per model** (shape ~44 s at 50 steps + texture ~48 s).
+- Model load is excluded from these numbers. The texture models load once per batch; `batch_demo.py` loads the shape model again for every image (see [Performance](#performance)).
+- The February 2026 figures (~35 s texture, ~80 s end-to-end) did not reproduce in this measurement. PyTorch is not the cause (2.5.1 and 2.8.0 measure the same); see [Performance](#performance).
 
-**Context:** upstream Hunyuan3D-2.1 [documents 29 GB VRAM](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) for shape + texture generation; this pipeline runs both on a single 24 GB RTX 4090. For reference, a third-party RTX 4090 benchmark ([SaladCloud, Oct 2025](https://blog.salad.com/hunyuan3d-2-1/), ComfyUI custom node, settings not published) reported a 139 s median per generation. That is not a controlled comparison (different settings).
+**Context:** upstream Hunyuan3D-2.1 [documents 29 GB VRAM](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) for shape + texture generation; this pipeline runs both on a single 24 GB RTX 4090 (measured peaks: 8.5 GiB reserved for shape, 19.0 GiB reserved / 11.0 GiB allocated for texture, in separate processes; see [GPU memory](#gpu-memory)). For reference, a third-party RTX 4090 benchmark ([SaladCloud, Oct 2025](https://blog.salad.com/hunyuan3d-2-1/), ComfyUI custom node, settings not published) reported a 139 s median per generation. That is not a controlled comparison (different settings).
 
 **Status:** a personal tool built for my own projects, shared for anyone who finds it useful. It is not regularly maintained; I update it when I return to it.
 
 ![10 sample models generated with the optimized pipeline](screenshots/grid.png)
 
-*10 models generated end-to-end (image to textured PBR mesh) on an RTX 4090 24 GB. Texture stage averaged ~35 s per model at 10 denoising steps, INT8 tensorcore mode, 6 views at 512 px; shape stage ~45 s per model at 50 steps. Model load excluded.*
+*10 models generated end-to-end (image to textured PBR mesh) on an RTX 4090 24 GB in February 2026. That run's texture stage averaged ~35 s per model at 10 denoising steps, INT8 tensorcore mode, 6 views at 512 px; shape stage ~45 s per model at 50 steps; model load excluded. The 2026-10-20 measurement is in [Performance](#performance).*
 
 ## What's Here
 
@@ -28,7 +29,9 @@ Wrapper scripts and custom CUDA kernels that optimize the Hunyuan3D-2.1 texture 
 | `csrc/` | CUDA kernels: INT8 TC GEMM (wmma), 2:4 Sparse TC GEMM (mma.sp) |
 | `generate.py` | One-shot CLI: image to mesh, optional `--texture` (uses the INT8 texture path) |
 | `start_server.py` / `client.py` | Launch the upstream Hunyuan3D API server (keeps models resident, default `127.0.0.1:8081`, `--low-vram` option) and send image requests to it |
-| `hy3d.bat` / `activate.bat` | Windows helpers: run `generate.py` with the local `venv`, or activate the `venv` |
+| `hy3d.bat` / `activate.bat` | Windows helpers: run `generate.py` with the local `venv`, or activate the `venv` (they use `venv`, not `venv-cu126`) |
+| `requirements-cu126.txt` | Pinned dependencies for the tested PyTorch 2.8.0 + cu126 environment |
+| `patches/hunyuan3d-2.1-windows.patch` | Changes to the Hunyuan3D-2.1 checkout that these scripts depend on (see Installation) |
 | `render_screenshots.py` / `repack_glb.py` | Render preview thumbnails/grid; re-export OBJ outputs as GLB with embedded metallic-roughness maps |
 | `tools/` | Development benchmarks, profilers and kernel tests (not needed to run the pipeline) |
 
@@ -37,26 +40,55 @@ Wrapper scripts and custom CUDA kernels that optimize the Hunyuan3D-2.1 texture 
 ### Prerequisites
 
 - **GPU**: NVIDIA RTX 4090 (24 GB VRAM) or similar Ada/Ampere GPU
-- **CUDA Toolkit**: 12.6+
-- **PyTorch**: 2.8+ with cu126
-- **Python**: 3.11+
-- [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) cloned as `./Hunyuan3D-2.1/`
+- **PyTorch**: 2.8.0 + cu126 (tested). The upstream pins with 2.5.1 + cu124 also work and measured the same speed.
+- **CUDA Toolkit + C++ compiler**: needed to build `custom_rasterizer` and the INT8 kernels (MSVC on Windows, gcc on Linux). Tested with the CUDA 12.4 toolkit against the cu126 wheels: PyTorch warns about the minor-version mismatch (12.4 vs 12.6), and the builds and kernel tests pass.
+- **Python**: 3.11 (tested 3.11.3)
+- [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) cloned as `./Hunyuan3D-2.1/` at commit `82920d6`, with `patches/hunyuan3d-2.1-windows.patch` applied
+
+Tested 2026-10-20 on Windows 11, RTX 4090, driver 617.14.
 
 ### Installation
 
 ```bash
-# Clone Hunyuan3D-2.1 into this directory
+# 1. Clone Hunyuan3D-2.1 into this directory and apply this repo's patch
 git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git
+cd Hunyuan3D-2.1
+git checkout 82920d6
+git apply ../patches/hunyuan3d-2.1-windows.patch
+mkdir -p hy3dpaint/ckpt
+curl -L -o hy3dpaint/ckpt/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+cd ..
 
-# Install PyTorch 2.8+ with CUDA 12.6
-pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+# 2. A new virtual environment (Windows; on Linux use venv-cu126/bin/activate)
+python -m venv venv-cu126
+source venv-cu126/Scripts/activate      # cmd.exe: venv-cu126\Scripts\activate
+python -m pip install --upgrade pip wheel
 
-# Install Hunyuan3D dependencies
-pip install -r Hunyuan3D-2.1/requirements.txt
+# 3. PyTorch 2.8.0 + CUDA 12.6
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126
 
-# Additional dependencies
-pip install pymeshlab fast_simplification timm
+# 4. Pipeline dependencies, pinned
+pip install -r requirements-cu126.txt
+
+# 5. Native extensions, compiled against the torch installed above
+#    (--no-build-isolation so the build sees that torch)
+pip install --no-build-isolation ./Hunyuan3D-2.1/hy3dpaint/custom_rasterizer
+pip install --no-build-isolation ./Hunyuan3D-2.1/hy3dpaint/DifferentiableRenderer
+
+# 6. Optional: build and check the INT8 kernels now instead of on first use
+INT8_KERNELS_STRICT=1 python tools/test_int8_memory.py
+INT8_KERNELS_STRICT=1 python tools/test_sparse_numerics.py
 ```
+
+The Hunyuan3D-2.1 and DINOv2 weights download from Hugging Face on first run.
+
+What the patch changes in Hunyuan3D-2.1 (the scripts here depend on it; without it, for example, `--steps` is silently ignored):
+
+- `custom_rasterizer`: `long` -> `int64_t` (Windows `long` is 32-bit) and `--allow-unsupported-compiler`, so it builds with MSVC.
+- `DifferentiableRenderer`: a `setup.py` for `mesh_inpaint_processor` (upstream ships only a Linux shell script), a shim module for it, ASCII-only comments in its C++ source, and TELEA inpainting.
+- Texture pipeline: configurable denoising steps, per-stage timing output, DINOv2 moved to CPU after use, `empty_cache()` before RealESRGAN, albedo and metallic-roughness inpainting in parallel, pymeshlab-only remesh, trimesh fallback for OBJ -> GLB when Blender's `bpy` is not installed.
+
+`texture.py` and `texture_batch.py` import the `custom_rasterizer` installed in the active environment first. A `custom_rasterizer_kernel` `.pyd` built in place under `Hunyuan3D-2.1/hy3dpaint/custom_rasterizer/` for a different torch version fails to load ("The specified procedure could not be found"), so it is used only if nothing is installed.
 
 ### Single Model (Texture Only)
 
@@ -94,39 +126,67 @@ python batch_demo.py --images img1.png img2.png img3.png
 
 ## Performance
 
-Benchmarked on RTX 4090 24GB, PyTorch 2.8, CUDA 12.6, Windows 11.
+**Measured 2026-10-20.** RTX 4090 24 GB (driver 617.14), i9-13900K, Windows 11, Python 3.11.3, PyTorch 2.8.0+cu126 / torchvision 0.23.0+cu126, packages from `requirements-cu126.txt`, kernels built with the CUDA 12.4 toolkit. Desktop applications were open (2.2-4.6 GB of VRAM in use before the runs).
 
-Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15), `--quantize-mode tensorcore`, 6 views at 512 px multiview resolution, 4096 px texture maps (views, resolution and texture size are the upstream defaults); shape 50 steps. Per-model times exclude model load, which is paid once per batch.
+Settings: texture 10 denoising steps (`--texture-steps 10`; upstream default 15), `--quantize-mode tensorcore` unless noted, 6 views at 512 px multiview resolution, 4096 px texture maps (views, resolution and texture size are the upstream defaults); shape 50 steps. Inputs: the first 5 `batch_demo.py` sample images (`ainimal_9`, `ainimal_14`, `004`, `073`, `202`), run as `python batch_demo.py --num 5 --texture-steps 10`. Tensorcore numbers pool two batch runs (10 textures); sparse is one run (`--skip-shape --quantize-mode sparse`, same meshes). Per-model times exclude model load.
 
 ### Texture Generation (per model)
 
-| Step | Time | Notes |
-|------|------|-------|
-| Remesh (pymeshlab) | 4-9s | Varies with mesh complexity |
-| UV unwrap | 3-6s | CPU-bound |
-| Multiview denoising | 9-17s | 10 steps, INT8 quantized UNet |
-| RealESRGAN enhance | 4s | GPU, requires empty_cache() before |
-| Texture baking | 2-3s | GPU |
-| Inpainting | 7-8s | CPU (TELEA, parallelized albedo+MR) |
-| Save + GLB convert | 1s | |
-| **Total per model** | **~35s** | |
-| Pipeline load (once) | ~14s | Amortized across batch |
+| Step | Feb 2026 | 2026-10-20 tensorcore, median (range) | 2026-10-20 sparse, median |
+|------|----------|----------------------------------------|---------------------------|
+| Remesh (pymeshlab, CPU) | 4-9 s | 8.2 s (4.9-13.5) | 8.9 s |
+| UV unwrap (xatlas, CPU) | 3-6 s | 5.2 s (3.8-7.1) | 5.2 s |
+| Load mesh, select views, render normal/position maps | not listed | 1.4 s | 1.5 s |
+| Multiview denoising (10 steps, INT8 UNet) | 9-17 s | 9.9 s (8.8-12.6) | 8.8 s (8.6-9.4) |
+| RealESRGAN enhance (GPU) | 4 s | 5.2 s (4.5-8.6) | 4.8 s |
+| Texture baking (GPU) | 2-3 s | 2.9 s (2.6-3.2) | 2.7 s |
+| Inpainting (CPU, TELEA, albedo and MR in parallel) | 7-8 s | 12.6 s (11.7-15.2) | 12.7 s |
+| Save + GLB convert | 1 s | 1.1 s | 1.1 s |
+| **Total per model** | **~35 s** | **48.2 s mean (44.6-53.3)** | **46.1 s mean (43.6-49.8)** |
+| Pipeline load (once per batch) | ~14 s | 20-25 s | 21 s |
+
+The first texture run in a fresh environment also compiles the INT8 kernels (about 40 s, once; cached under `torch_extensions`).
 
 ### Shape Generation
 
-| Metric | Value |
-|--------|-------|
-| Per model (50 steps) | ~45s |
-| Model load (once) | ~30s |
+| Metric | Feb 2026 | 2026-10-20 |
+|--------|----------|------------|
+| Per model (50 steps) | ~45 s | 44.0 s mean (41.7-48.8) |
+| Model load | ~30 s | ~42 s (85 s cold, first run) |
 
-### End-to-End (10 Models, Batch)
+`batch_demo.py` runs each shape job in its own process, so the shape model load (plus ~15 s of process start and imports) is paid for every image, not once per batch.
 
-| Phase | Time |
-|-------|------|
-| Shape gen (10 models) | ~7.5 min |
-| Texture pipeline load | ~14s |
-| Texture gen (10 models) | ~5.5 min |
-| **Total** | **~13 min** |
+### End-to-End (5 Models, Batch)
+
+| Phase | 2026-10-20 |
+|-------|------------|
+| Shape phase (5 models, including per-image process start and model load) | ~626 s (~125 s per image) |
+| Texture phase (process start, pipeline load 25 s, quantization + one-time kernel build 62 s, 5 x ~50 s) | ~347 s |
+| **Total wall time** | **973 s (16.2 min)** |
+| Per model, generation only (shape + texture, model load excluded) | ~92 s |
+
+The February table gave ~7.5 min for 10 shapes, which is 10 x 45 s of generation only; it did not count the per-image model load.
+
+### GPU Memory
+
+Peaks per stage from `torch.cuda.max_memory_allocated()` / `max_memory_reserved()` (reset at each stage boundary; GiB), same runs as above:
+
+| Stage | Peak allocated | Peak reserved |
+|-------|----------------|---------------|
+| Shape generation (its own process) | 7.7 GiB | 8.5 GiB |
+| Texture: models resident between stages (after INT8 quantization, DINOv2 on CPU) | 4.9 GiB | - |
+| Texture: multiview denoising, tensorcore | 11.0 GiB | 19.0 GiB |
+| Texture: multiview denoising, sparse | 10.7 GiB | 17.9 GiB |
+| Texture: baking | 8.5 GiB | 9.8 GiB |
+| Whole GPU (`nvidia-smi`, including ~2.2-4.6 GB used by the desktop) | 21.4 GiB max | |
+
+How it fits in 24 GB: shape and texture never share a process, so their peaks do not add; the UNet and DINOv2 Linear weights are INT8; DINOv2 moves to the CPU after it runs. During denoising the allocator caches up to 19 GiB while about 11 GiB is in use; `empty_cache()` before RealESRGAN returns it.
+
+### PyTorch 2.5.1 vs 2.8.0, and the February numbers
+
+Same day, same 5 images, in a second environment with torch 2.5.1+cu124 and the upstream Hunyuan3D-2.1 pins (diffusers 0.30.0, transformers 4.46.0): shape 42.3 s, texture 48.9 s mean (43.5-53.8), total wall 890 s. That matches PyTorch 2.8.0 within run-to-run variation, so the PyTorch version does not explain the gap to the February numbers.
+
+The February environment was not recorded. Package install dates and build caches on the machine indicate the system Python 3.11 with torch 2.8.0+cu126 in user site-packages, pymeshlab 2025.7 and opencv 4.13 (this environment: pymeshlab 2022.2, opencv 4.11). Those library versions were checked directly and do not explain it either: remeshing a 596k-face mesh to 40k faces took 4.8-5.3 s with pymeshlab 2022.2 vs 5.6-5.9 s with 2025.7, and `cv2.inpaint` (TELEA, 4096 px) 6.3-6.5 s with opencv 4.11 vs 6.4-6.6 s with 4.13. Most of the difference is in CPU stages, mainly inpainting (12.6 s vs 7-8 s; in a profiled run it is two concurrent `cv2.inpaint` calls of ~9.9 s each on 4096 px textures). The cause is not identified.
 
 ## Optimizations
 
@@ -158,12 +218,12 @@ Albedo and metallic-roughness texture inpainting run concurrently via ThreadPool
 
 ### Batch Pipeline Loading
 
-`texture_batch.py` loads the ~2GB texture pipeline once and processes all meshes sequentially, saving ~14s per additional model vs individual `texture.py` calls.
+`texture_batch.py` loads the ~2GB texture pipeline once and processes all meshes sequentially, saving the pipeline load (20-25 s measured 2026-10-20; ~14 s in February) plus quantization for each additional model vs individual `texture.py` calls.
 
-### PyTorch 2.8 Workarounds
+### Load Workarounds
 
-- Monkey-patches `torch.load` with `mmap=False` to work around intermittent `PytorchStreamReader` corruption
-- Includes torchvision compatibility fix for removed `functional_tensor` module
+- Monkey-patches `torch.load` with `mmap=False`, and `batch_demo.py` retries the texture process, to work around intermittent `PytorchStreamReader` errors (see Known Issues)
+- Includes torchvision compatibility fix for removed `functional_tensor` module (torchvision 0.17+)
 
 ## CUDA Kernels (`csrc/`)
 
@@ -176,7 +236,7 @@ Albedo and metallic-roughness texture inpainting run concurrently via ThreadPool
 
 `int8_sparse_tc.cu` is [sparsemma](https://github.com/WizardsForgeGames/sparsemma)'s current kernel (synced at sparsemma `6ed9a75`); `int8_gemm_tc.cu` matches sparsemma's and `int8_kernels.cu` differs only in comments. The copies here are ASCII-only so torch's JIT build can read them under non-UTF-8 Windows code pages (e.g. cp932).
 
-Kernels are JIT-compiled on first use via `torch.utils.cpp_extension`. Requires CUDA Toolkit 12.6+ and a C++ compiler (MSVC on Windows, gcc on Linux).
+Kernels are JIT-compiled on first use via `torch.utils.cpp_extension`. Requires a CUDA 12.x toolkit and a C++ compiler (MSVC on Windows, gcc on Linux); tested with the 12.4 toolkit and PyTorch 2.8.0+cu126.
 
 ## Output Format
 
@@ -190,27 +250,14 @@ Each model produces:
 
 ## Requirements
 
-```
-torch >= 2.8.0 (cu126)
-torchvision >= 0.23.0
-diffusers >= 0.30.0
-trimesh
-pymeshlab
-fast_simplification
-timm
-Pillow
-opencv-python
-numpy
-omegaconf
-huggingface_hub
-```
+The tested set is pinned in `requirements-cu126.txt` (install torch 2.8.0 / torchvision 0.23.0 from the cu126 index first; see Installation). The main pins: diffusers 0.30.0, transformers 4.46.0, accelerate 1.1.1, huggingface-hub 0.30.2, numpy 2.2.6, opencv-python 4.10.0.84, pymeshlab 2022.2.post3, trimesh 4.4.7, xatlas 0.0.9, realesrgan 0.3.0, timm 1.0.24. `custom_rasterizer` and `mesh_inpaint_processor` are built from the patched Hunyuan3D-2.1 checkout.
 
 ## Known Issues
 
 **If a kernel fails to build**, `Int8Linear` falls back to a slower path and prints a boxed warning naming the kernel and the error (once per process). Set `INT8_KERNELS_STRICT=1` to make that an error instead. On Windows with a non-UTF-8 code page, older PyTorch versions can fail to read kernel sources; the sources are ASCII-only for that reason, and `PYTHONUTF8=1` also avoids it.
 
 - **Intermittent CUDA slowdowns**: 1-2 out of 10 models may experience 2-5x slower denoising in batch mode. Re-running typically resolves it. Caused by PyTorch CUDA allocator behavior under sustained load.
-- **PyTorch 2.8 torch.load corruption**: Intermittent `PytorchStreamReader` errors. Mitigated by `mmap=False` monkey-patch and retry logic.
+- **torch.load `PytorchStreamReader` errors**: intermittent, while the texture pipeline loads. Not specific to PyTorch 2.8: on 2026-10-20 it hit 2 of 4 batch runs, one on 2.5.1 and one on 2.8.0, and the retry recovered both. Loading the RealESRGAN checkpoint alone in 20 fresh processes did not reproduce it. Mitigated by the `mmap=False` monkey-patch and retry logic.
 - **Windows path separator**: Batch mode uses `|` as pair separator (not `:`) to avoid conflicts with Windows drive letters.
 
 ## License

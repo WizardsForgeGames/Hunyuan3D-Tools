@@ -1,0 +1,58 @@
+# Pinned environment for PyTorch 2.8.0 + CUDA 12.6 (Windows 11, Python 3.11, RTX 4090).
+# Tested 2026-10-20. Install torch first, from the cu126 index:
+#   python -m pip install --upgrade pip wheel
+#   pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126
+#   pip install -r requirements-cu126.txt
+# Then build custom_rasterizer and mesh_inpaint_processor with --no-build-isolation (see README).
+# Versions are those of the working torch 2.5.1 environment (the upstream Hunyuan3D-2.1 pins
+# where they install on Windows / Python 3.11; numpy 2.x, pytorch-lightning 2.x, onnxruntime
+# 1.24 and scikit-image 0.26 are newer than upstream), with torch/torchvision changed and
+# packages the pipeline does not import (open3d, cupy, gradio, ...) left out. bitsandbytes
+# (only for --quantize-mode bnb) is not included.
+
+# Build tools (custom_rasterizer, mesh_inpaint_processor, csrc/ JIT kernels)
+ninja==1.11.1.1
+pybind11==2.13.4
+
+# Core ML
+transformers==4.46.0
+tokenizers==0.20.3
+diffusers==0.30.0
+accelerate==1.1.1
+huggingface-hub==0.30.2
+safetensors==0.4.4
+pytorch-lightning==2.6.1
+torchmetrics==1.8.2
+timm==1.0.24
+torchdiffeq==0.2.5
+
+# Scientific computing
+numpy==2.2.6
+scipy==1.14.1
+einops==0.8.0
+
+# Image processing
+pillow==12.0.0
+opencv-python==4.10.0.84
+# rembg pulls in the headless build; pin it so both cv2 providers stay on 4.x
+opencv-python-headless==4.11.0.86
+imageio==2.36.0
+scikit-image==0.26.0
+matplotlib==3.10.8
+rembg==2.0.65
+onnxruntime==1.24.1
+realesrgan==0.3.0
+basicsr==1.4.2
+
+# 3D mesh processing
+trimesh==4.4.7
+pymeshlab==2022.2.post3
+pygltflib==1.16.3
+xatlas==0.0.9
+
+# Config / utilities
+omegaconf==2.3.0
+pyyaml==6.0.2
+configargparse==1.7.1
+tqdm==4.66.5
+psutil==7.2.2

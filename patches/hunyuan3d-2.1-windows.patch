@@ -1,0 +1,754 @@
+diff --git a/hy3dpaint/DifferentiableRenderer/MeshRender.py b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+index 83c8cf8..e98a557 100644
+--- a/hy3dpaint/DifferentiableRenderer/MeshRender.py
++++ b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+@@ -1378,7 +1378,7 @@ class MeshRender:
+         return texture_merge, trust_map_merge > 1e-8
+ 
+     @torch.no_grad()
+-    def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="NS", return_float=False):
++    def uv_inpaint(self, texture, mask, vertex_inpaint=True, method="TELEA", return_float=False):
+         """
+         Inpaint missing regions in UV texture using mesh-aware and traditional methods.
+         
+@@ -1407,7 +1407,10 @@ class MeshRender:
+             vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
+             texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+ 
+-        if method == "NS":
++        if method == "TELEA":
++            texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_TELEA)
++            assert return_float == False
++        elif method == "NS":
+             texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_NS)
+             assert return_float == False
+ 
+diff --git a/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.cpp b/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.cpp
+index 2567871..7d9d0c0 100644
+--- a/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.cpp
++++ b/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.cpp
+@@ -12,7 +12,7 @@ namespace py = pybind11;
+ using namespace std;
+ 
+ namespace {
+-// 内部数据结构，避免重复的buffer获取和指针设置
++// Internal data structure: avoids repeated buffer acquisition and pointer setup
+ struct MeshData {
+     int texture_height, texture_width, texture_channel;
+     int vtx_num;
+@@ -23,7 +23,7 @@ struct MeshData {
+     int* pos_idx_ptr;
+     int* uv_idx_ptr;
+     
+-    // 存储buffer以防止被销毁
++    // Keep the buffers alive so they are not destroyed
+     py::buffer_info texture_buf, mask_buf, vtx_pos_buf, vtx_uv_buf, pos_idx_buf, uv_idx_buf;
+     
+     MeshData(py::array_t<float>& texture, py::array_t<uint8_t>& mask, 
+@@ -51,14 +51,14 @@ struct MeshData {
+     }
+ };
+ 
+-// 公共函数：计算UV坐标
++// Shared helper: compute UV coordinates
+ pair<int, int> calculateUVCoordinates(int vtx_uv_idx, const MeshData& data) {
+     int uv_v = round(data.vtx_uv_ptr[vtx_uv_idx * 2] * (data.texture_width - 1));
+     int uv_u = round((1.0 - data.vtx_uv_ptr[vtx_uv_idx * 2 + 1]) * (data.texture_height - 1));
+     return make_pair(uv_u, uv_v);
+ }
+ 
+-// 公共函数：计算距离权重
++// Shared helper: compute distance weight
+ float calculateDistanceWeight(const array<float, 3>& vtx_0, const array<float, 3>& vtx1) {
+     float dist_weight = 1.0f / max(
+         sqrt(
+@@ -69,14 +69,14 @@ float calculateDistanceWeight(const array<float, 3>& vtx_0, const array<float, 3
+     return dist_weight * dist_weight;
+ }
+ 
+-// 公共函数：获取顶点位置
++// Shared helper: get vertex position
+ array<float, 3> getVertexPosition(int vtx_idx, const MeshData& data) {
+     return {data.vtx_pos_ptr[vtx_idx * 3], 
+             data.vtx_pos_ptr[vtx_idx * 3 + 1], 
+             data.vtx_pos_ptr[vtx_idx * 3 + 2]};
+ }
+ 
+-// 公共函数：构建图结构
++// Shared helper: build the graph structure
+ void buildGraph(vector<vector<int>>& G, const MeshData& data) {
+     G.resize(data.vtx_num);
+     for(int i = 0; i < data.uv_idx_buf.shape[0]; ++i) {
+@@ -86,7 +86,7 @@ void buildGraph(vector<vector<int>>& G, const MeshData& data) {
+     }
+ }
+ 
+-// 通用初始化函数：处理两种掩码类型（float和int）
++// Generic init: handles both mask types (float and int)
+ template<typename MaskType>
+ void initializeVertexDataGeneric(const MeshData& data, vector<MaskType>& vtx_mask, 
+                                 vector<vector<float>>& vtx_color, vector<int>* uncolored_vtxs = nullptr,
+@@ -117,7 +117,7 @@ void initializeVertexDataGeneric(const MeshData& data, vector<MaskType>& vtx_mas
+     }
+ }
+ 
+-// 通用平滑算法：支持不同的掩码类型和检查函数
++// Generic smoothing: supports different mask types and check functions
+ template<typename MaskType>
+ void performSmoothingAlgorithm(const MeshData& data, const vector<vector<int>>& G,
+                               vector<MaskType>& vtx_mask, vector<vector<float>>& vtx_color, 
+@@ -167,7 +167,7 @@ void performSmoothingAlgorithm(const MeshData& data, const vector<vector<int>>&
+     }
+ }
+ 
+-// 前向传播算法的通用实现
++// Generic implementation of the forward propagation algorithm
+ void performForwardPropagation(const MeshData& data, const vector<vector<int>>& G,
+                               vector<float>& vtx_mask, vector<vector<float>>& vtx_color,
+                               queue<int>& active_vtxs) {
+@@ -209,7 +209,7 @@ void performForwardPropagation(const MeshData& data, const vector<vector<int>>&
+     }
+ }
+ 
+-// 公共函数：创建输出数组
++// Shared helper: create output arrays
+ pair<py::array_t<float>, py::array_t<uint8_t>> createOutputArrays(
+     const MeshData& data, const vector<float>& vtx_mask, 
+     const vector<vector<float>>& vtx_color) {
+@@ -253,7 +253,7 @@ pair<py::array_t<float>, py::array_t<uint8_t>> createOutputArrays(
+     return make_pair(new_texture, new_mask);
+ }
+ 
+-// 创建顶点颜色输出数组的专用函数
++// Create the vertex color output arrays
+ pair<py::array_t<float>, py::array_t<uint8_t>> createVertexColorOutput(
+     const MeshData& data, const vector<int>& vtx_mask, 
+     const vector<vector<float>>& vtx_color) {
+@@ -279,7 +279,7 @@ pair<py::array_t<float>, py::array_t<uint8_t>> createVertexColorOutput(
+ 
+ } // anonymous namespace
+ 
+-// 重构后的 meshVerticeInpaint_smooth 函数
++// Refactored meshVerticeInpaint_smooth
+ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint_smooth(
+     py::array_t<float> texture, py::array_t<uint8_t> mask, py::array_t<float> vtx_pos, py::array_t<float> vtx_uv,
+     py::array_t<int> pos_idx, py::array_t<int> uv_idx) {
+@@ -294,16 +294,16 @@ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint_smooth(
+     initializeVertexDataGeneric(data, vtx_mask, vtx_color, &uncolored_vtxs, 1.0f);
+     buildGraph(G, data);
+ 
+-    // 使用通用平滑算法
++    // Use the generic smoothing algorithm
+     performSmoothingAlgorithm<float>(data, G, vtx_mask, vtx_color, uncolored_vtxs,
+-        [](float mask_val) { return mask_val > 0; },  // 检查是否着色
+-        [](float& mask_val) { mask_val = 1.0f; }      // 设置为已着色
++        [](float mask_val) { return mask_val > 0; },  // is it colored?
++        [](float& mask_val) { mask_val = 1.0f; }      // mark as colored
+     );
+ 
+     return createOutputArrays(data, vtx_mask, vtx_color);
+ }
+ 
+-// 重构后的 meshVerticeInpaint_forward 函数
++// Refactored meshVerticeInpaint_forward
+ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint_forward(
+     py::array_t<float> texture, py::array_t<uint8_t> mask, py::array_t<float> vtx_pos, py::array_t<float> vtx_uv,
+     py::array_t<int> pos_idx, py::array_t<int> uv_idx) {
+@@ -315,24 +315,24 @@ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint_forward(
+     vector<vector<int>> G;
+     queue<int> active_vtxs;
+ 
+-    // 使用通用初始化（不需要 uncolored_vtxs）
++    // Use the generic init (uncolored_vtxs not needed)
+     initializeVertexDataGeneric(data, vtx_mask, vtx_color, nullptr, 1.0f);
+     buildGraph(G, data);
+ 
+-    // 收集活跃顶点
++    // Collect active vertices
+     for(int i = 0; i < data.vtx_num; ++i) {
+         if(vtx_mask[i] == 1.0f) {
+             active_vtxs.push(i);
+         }
+     }
+ 
+-    // 使用通用前向传播算法
++    // Use the generic forward propagation algorithm
+     performForwardPropagation(data, G, vtx_mask, vtx_color, active_vtxs);
+ 
+     return createOutputArrays(data, vtx_mask, vtx_color);
+ }
+ 
+-// 主接口函数
++// Main entry point
+ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint(
+     py::array_t<float> texture, py::array_t<uint8_t> mask, py::array_t<float> vtx_pos, py::array_t<float> vtx_uv,
+     py::array_t<int> pos_idx, py::array_t<int> uv_idx, const string& method = "smooth") {
+@@ -348,7 +348,7 @@ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeInpaint(
+ 
+ //============================
+ 
+-// 重构后的 meshVerticeColor_smooth 函数
++// Refactored meshVerticeColor_smooth
+ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeColor_smooth(
+     py::array_t<float> texture, py::array_t<uint8_t> mask, py::array_t<float> vtx_pos, py::array_t<float> vtx_uv,
+     py::array_t<int> pos_idx, py::array_t<int> uv_idx) {
+@@ -363,16 +363,16 @@ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeColor_smooth(
+     initializeVertexDataGeneric(data, vtx_mask, vtx_color, &uncolored_vtxs, 1);
+     buildGraph(G, data);
+ 
+-    // 使用通用平滑算法
++    // Use the generic smoothing algorithm
+     performSmoothingAlgorithm<int>(data, G, vtx_mask, vtx_color, uncolored_vtxs,
+-        [](int mask_val) { return mask_val > 0; },    // 检查是否着色
+-        [](int& mask_val) { mask_val = 2; }           // 设置为已着色（值为2）
++        [](int mask_val) { return mask_val > 0; },    // is it colored?
++        [](int& mask_val) { mask_val = 2; }           // mark as colored (value 2)
+     );
+ 
+     return createVertexColorOutput(data, vtx_mask, vtx_color);
+ }
+ 
+-// meshVerticeColor 主接口函数
++// meshVerticeColor main entry point
+ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeColor(
+     py::array_t<float> texture, py::array_t<uint8_t> mask, py::array_t<float> vtx_pos, py::array_t<float> vtx_uv,
+     py::array_t<int> pos_idx, py::array_t<int> uv_idx, const string& method = "smooth") {
+@@ -384,7 +384,7 @@ pair<py::array_t<float>, py::array_t<uint8_t>> meshVerticeColor(
+     }
+ }
+ 
+-// Python绑定
++// Python bindings
+ PYBIND11_MODULE(mesh_inpaint_processor, m) {
+     m.def("meshVerticeInpaint", &meshVerticeInpaint, "A function to process mesh", 
+           py::arg("texture"), py::arg("mask"), py::arg("vtx_pos"), py::arg("vtx_uv"), 
+diff --git a/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.py b/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.py
+new file mode 100644
+index 0000000..7a863df
+--- /dev/null
++++ b/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.py
+@@ -0,0 +1,2 @@
++"""Shim to re-export the compiled mesh_inpaint_processor extension as a submodule."""
++from mesh_inpaint_processor import meshVerticeInpaint, meshVerticeColor
+diff --git a/hy3dpaint/DifferentiableRenderer/mesh_utils.py b/hy3dpaint/DifferentiableRenderer/mesh_utils.py
+index 5b3e831..f544106 100644
+--- a/hy3dpaint/DifferentiableRenderer/mesh_utils.py
++++ b/hy3dpaint/DifferentiableRenderer/mesh_utils.py
+@@ -14,7 +14,6 @@
+ 
+ import os
+ import cv2
+-import bpy
+ import math
+ import numpy as np
+ from io import StringIO
+@@ -199,6 +198,7 @@ def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=Non
+ 
+ def _setup_blender_scene():
+     """Setup Blender scene for conversion."""
++    import bpy
+     if "convert" not in bpy.data.scenes:
+         bpy.data.scenes.new("convert")
+     bpy.context.window.scene = bpy.data.scenes["convert"]
+@@ -206,6 +206,7 @@ def _setup_blender_scene():
+ 
+ def _clear_scene_objects():
+     """Clear all objects from current Blender scene."""
++    import bpy
+     for obj in bpy.context.scene.objects:
+         obj.select_set(True)
+         bpy.data.objects.remove(obj, do_unlink=True)
+@@ -213,6 +214,7 @@ def _clear_scene_objects():
+ 
+ def _select_mesh_objects():
+     """Select all mesh objects in scene."""
++    import bpy
+     bpy.ops.object.select_all(action="DESELECT")
+     for obj in bpy.context.scene.objects:
+         if obj.type == "MESH":
+@@ -224,6 +226,7 @@ def _merge_vertices_if_needed(merge_vertices: bool):
+     if not merge_vertices:
+         return
+ 
++    import bpy
+     for obj in bpy.context.selected_objects:
+         if obj.type == "MESH":
+             bpy.context.view_layer.objects.active = obj
+@@ -235,6 +238,7 @@ def _merge_vertices_if_needed(merge_vertices: bool):
+ 
+ def _apply_shading(shade_type: str, auto_smooth_angle: float):
+     """Apply shading to selected objects."""
++    import bpy
+     shading_ops = {
+         "SMOOTH": lambda: bpy.ops.object.shade_smooth(),
+         "FLAT": lambda: bpy.ops.object.shade_flat(),
+@@ -247,6 +251,7 @@ def _apply_shading(shade_type: str, auto_smooth_angle: float):
+ 
+ def _apply_auto_smooth(auto_smooth_angle: float):
+     """Apply auto smooth based on Blender version."""
++    import bpy
+     angle_rad = math.radians(auto_smooth_angle)
+ 
+     if bpy.app.version < (4, 1, 0):
+@@ -264,21 +269,26 @@ def convert_obj_to_glb(
+     auto_smooth_angle: float = 60,
+     merge_vertices: bool = False,
+ ) -> bool:
+-    """Convert OBJ file to GLB format using Blender."""
++    """Convert OBJ file to GLB format. Uses Blender if available, falls back to trimesh."""
+     try:
++        import bpy
+         _setup_blender_scene()
+         _clear_scene_objects()
+-
+-        # Import OBJ file
+         bpy.ops.wm.obj_import(filepath=obj_path)
+         _select_mesh_objects()
+-
+-        # Process meshes
+         _merge_vertices_if_needed(merge_vertices)
+         _apply_shading(shade_type, auto_smooth_angle)
+-
+-        # Export to GLB
+         bpy.ops.export_scene.gltf(filepath=glb_path, use_active_scene=True)
+         return True
+-    except Exception:
++    except ImportError:
++        pass
++
++    # Fallback: use trimesh for OBJ -> GLB conversion
++    try:
++        import trimesh
++        scene = trimesh.load(obj_path, process=False)
++        scene.export(glb_path)
++        return True
++    except Exception as e:
++        print(f"Warning: GLB conversion failed: {e}")
+         return False
+diff --git a/hy3dpaint/DifferentiableRenderer/setup.py b/hy3dpaint/DifferentiableRenderer/setup.py
+new file mode 100644
+index 0000000..2a9383d
+--- /dev/null
++++ b/hy3dpaint/DifferentiableRenderer/setup.py
+@@ -0,0 +1,17 @@
++from setuptools import setup, Extension
++from pybind11.setup_helpers import Pybind11Extension, build_ext
++
++ext_modules = [
++    Pybind11Extension(
++        "mesh_inpaint_processor",
++        ["mesh_inpaint_processor.cpp"],
++        cxx_std=11,
++    ),
++]
++
++setup(
++    name="mesh_inpaint_processor",
++    version="0.1",
++    ext_modules=ext_modules,
++    cmdclass={"build_ext": build_ext},
++)
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor.cpp b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor.cpp
+index f02bcba..5b9edb4 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor.cpp
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor.cpp
+@@ -394,8 +394,8 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy(std::vector<torch::Tenso
+     std::vector<torch::Tensor> grid_evencorners(grids.size());
+     std::vector<torch::Tensor> grid_oddcorners(grids.size());
+ 
+-    texture_positions[0] = torch::zeros({seq2pos.size() / 3, 3}, float_options);
+-    texture_positions[1] = torch::zeros({seq2pos.size() / 3}, float_options);
++    texture_positions[0] = torch::zeros({(int64_t)(seq2pos.size() / 3), (int64_t)3}, float_options);
++    texture_positions[1] = torch::zeros({(int64_t)(seq2pos.size() / 3)}, float_options);
+     float* positions_out_ptr = texture_positions[0].data_ptr<float>();
+     memcpy(positions_out_ptr, seq2pos.data(), sizeof(float) * seq2pos.size());
+     positions_out_ptr = texture_positions[1].data_ptr<float>();
+@@ -404,25 +404,25 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy(std::vector<torch::Tenso
+     }
+ 
+     for (int i = 0; i < grids.size(); ++i) {
+-        grid_neighbors[i] = torch::zeros({grids[i].seq2grid.size(), 9}, int64_options);
+-        long* nptr = grid_neighbors[i].data_ptr<long>();
++        grid_neighbors[i] = torch::zeros({(int64_t)grids[i].seq2grid.size(), (int64_t)9}, int64_options);
++        int64_t* nptr = grid_neighbors[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2neighbor.size(); ++j) {
+             nptr[j] = grids[i].seq2neighbor[j];
+         }
+ 
+-        grid_evencorners[i] = torch::zeros({grids[i].seq2evencorner.size()}, int64_options);
+-        grid_oddcorners[i] = torch::zeros({grids[i].seq2oddcorner.size()}, int64_options);
+-        long* dptr = grid_evencorners[i].data_ptr<long>();
++        grid_evencorners[i] = torch::zeros({(int64_t)grids[i].seq2evencorner.size()}, int64_options);
++        grid_oddcorners[i] = torch::zeros({(int64_t)grids[i].seq2oddcorner.size()}, int64_options);
++        int64_t* dptr = grid_evencorners[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2evencorner.size(); ++j) {
+             dptr[j] = grids[i].seq2evencorner[j];
+         }
+-        dptr = grid_oddcorners[i].data_ptr<long>();
++        dptr = grid_oddcorners[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2oddcorner.size(); ++j) {
+             dptr[j] = grids[i].seq2oddcorner[j];
+-        }            
++        }
+         if (i + 1 < grids.size()) {
+-            grid_downsamples[i] = torch::zeros({grids[i].downsample_seq.size()}, int64_options);
+-            long* dptr = grid_downsamples[i].data_ptr<long>();
++            grid_downsamples[i] = torch::zeros({(int64_t)grids[i].downsample_seq.size()}, int64_options);
++            int64_t* dptr = grid_downsamples[i].data_ptr<int64_t>();
+             for (int j = 0; j < grids[i].downsample_seq.size(); ++j) {
+                 dptr[j] = grids[i].downsample_seq[j];
+             }
+@@ -534,9 +534,9 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy_with_feat(
+     std::vector<torch::Tensor> grid_evencorners(grids.size());
+     std::vector<torch::Tensor> grid_oddcorners(grids.size());
+ 
+-    texture_positions[0] = torch::zeros({seq2pos.size() / 3, 3}, float_options);
+-    texture_positions[1] = torch::zeros({seq2pos.size() / 3}, float_options);
+-    texture_feats[0] = torch::zeros({seq2feat.size() / feat_channel, feat_channel}, float_options);
++    texture_positions[0] = torch::zeros({(int64_t)(seq2pos.size() / 3), (int64_t)3}, float_options);
++    texture_positions[1] = torch::zeros({(int64_t)(seq2pos.size() / 3)}, float_options);
++    texture_feats[0] = torch::zeros({(int64_t)(seq2feat.size() / feat_channel), (int64_t)feat_channel}, float_options);
+     float* positions_out_ptr = texture_positions[0].data_ptr<float>();
+     memcpy(positions_out_ptr, seq2pos.data(), sizeof(float) * seq2pos.size());
+     positions_out_ptr = texture_positions[1].data_ptr<float>();
+@@ -547,24 +547,24 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy_with_feat(
+     memcpy(feats_out_ptr, seq2feat.data(), sizeof(float) * seq2feat.size());
+ 
+     for (int i = 0; i < grids.size(); ++i) {
+-        grid_neighbors[i] = torch::zeros({grids[i].seq2grid.size(), 9}, int64_options);
+-        long* nptr = grid_neighbors[i].data_ptr<long>();
++        grid_neighbors[i] = torch::zeros({(int64_t)grids[i].seq2grid.size(), (int64_t)9}, int64_options);
++        int64_t* nptr = grid_neighbors[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2neighbor.size(); ++j) {
+             nptr[j] = grids[i].seq2neighbor[j];
+         }
+-        grid_evencorners[i] = torch::zeros({grids[i].seq2evencorner.size()}, int64_options);
+-        grid_oddcorners[i] = torch::zeros({grids[i].seq2oddcorner.size()}, int64_options);
+-        long* dptr = grid_evencorners[i].data_ptr<long>();
++        grid_evencorners[i] = torch::zeros({(int64_t)grids[i].seq2evencorner.size()}, int64_options);
++        grid_oddcorners[i] = torch::zeros({(int64_t)grids[i].seq2oddcorner.size()}, int64_options);
++        int64_t* dptr = grid_evencorners[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2evencorner.size(); ++j) {
+             dptr[j] = grids[i].seq2evencorner[j];
+         }
+-        dptr = grid_oddcorners[i].data_ptr<long>();
++        dptr = grid_oddcorners[i].data_ptr<int64_t>();
+         for (int j = 0; j < grids[i].seq2oddcorner.size(); ++j) {
+             dptr[j] = grids[i].seq2oddcorner[j];
+         }
+         if (i + 1 < grids.size()) {
+-            grid_downsamples[i] = torch::zeros({grids[i].downsample_seq.size()}, int64_options);
+-            long* dptr = grid_downsamples[i].data_ptr<long>();
++            grid_downsamples[i] = torch::zeros({(int64_t)grids[i].downsample_seq.size()}, int64_options);
++            int64_t* dptr = grid_downsamples[i].data_ptr<int64_t>();
+             for (int j = 0; j < grids[i].downsample_seq.size(); ++j) {
+                 dptr[j] = grids[i].downsample_seq[j];
+             }
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+index b3ff69f..4af6eeb 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+@@ -100,24 +100,24 @@ std::vector<torch::Tensor> rasterize_image_cpu(torch::Tensor V, torch::Tensor F,
+     auto INT64_options = torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
+     auto findices = torch::zeros({height, width}, options);
+     INT64 maxint = (INT64)MAXINT * (INT64)MAXINT + (MAXINT - 1);
+-    auto z_min = torch::ones({height, width}, INT64_options) * (long)maxint;
++    auto z_min = torch::ones({height, width}, INT64_options) * (int64_t)maxint;
+ 
+     if (!use_depth_prior) {
+         for (int i = 0; i < num_faces; ++i) {
+             rasterizeImagecoordsKernelCPU(V.data_ptr<float>(), F.data_ptr<int>(), 0,
+-                (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces, i); 
++                (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces, i); 
+         }
+     } else {
+         for (int i = 0; i < num_faces; ++i)
+             rasterizeImagecoordsKernelCPU(V.data_ptr<float>(), F.data_ptr<int>(), D.data_ptr<float>(),
+-                (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces, i);
++                (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces, i);
+     }
+ 
+     auto float_options = torch::TensorOptions().dtype(torch::kFloat32).requires_grad(false);
+     auto barycentric = torch::zeros({height, width, 3}, float_options);
+     for (int i = 0; i < width * height; ++i)
+         barycentricFromImgcoordCPU(V.data_ptr<float>(), F.data_ptr<int>(),
+-            findices.data_ptr<int>(), (INT64*)z_min.data_ptr<long>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>(), i);
++            findices.data_ptr<int>(), (INT64*)z_min.data_ptr<int64_t>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>(), i);
+ 
+     return {findices, barycentric};
+ }
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.cu b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.cu
+index 709c1b8..cc6f354 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.cu
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.cu
+@@ -108,20 +108,20 @@ std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F,
+     auto INT64_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, device_id).requires_grad(false);
+     auto findices = torch::zeros({height, width}, options);
+     INT64 maxint = (INT64)MAXINT * (INT64)MAXINT + (MAXINT - 1);
+-    auto z_min = torch::ones({height, width}, INT64_options) * (long)maxint;
++    auto z_min = torch::ones({height, width}, INT64_options) * (int64_t)maxint;
+ 
+     if (!use_depth_prior) {
+         rasterizeImagecoordsKernelGPU<<<(num_faces+255)/256,256,0,at::cuda::getCurrentCUDAStream()>>>(V.data_ptr<float>(), F.data_ptr<int>(), 0,
+-            (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces); 
++            (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces); 
+     } else {
+         rasterizeImagecoordsKernelGPU<<<(num_faces+255)/256,256,0,at::cuda::getCurrentCUDAStream()>>>(V.data_ptr<float>(), F.data_ptr<int>(), D.data_ptr<float>(),
+-            (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces); 
++            (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces); 
+     }
+ 
+     auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id).requires_grad(false);
+     auto barycentric = torch::zeros({height, width, 3}, float_options);
+     barycentricFromImgcoordGPU<<<(width * height + 255)/256, 256>>>(V.data_ptr<float>(), F.data_ptr<int>(),
+-        findices.data_ptr<int>(), (INT64*)z_min.data_ptr<long>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>());
++        findices.data_ptr<int>(), (INT64*)z_min.data_ptr<int64_t>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>());
+ 
+     return {findices, barycentric};
+ }
+diff --git a/hy3dpaint/custom_rasterizer/setup.py b/hy3dpaint/custom_rasterizer/setup.py
+index 15192e9..1b525e5 100644
+--- a/hy3dpaint/custom_rasterizer/setup.py
++++ b/hy3dpaint/custom_rasterizer/setup.py
+@@ -25,6 +25,9 @@ custom_rasterizer_module = CUDAExtension(
+         "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
+         "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
+     ],
++    extra_compile_args={
++        "nvcc": ["--allow-unsupported-compiler"],
++    },
+ )
+ 
+ setup(
+diff --git a/hy3dpaint/hunyuanpaintpbr/pipeline.py b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+index 871dae5..b3c1b5c 100644
+--- a/hy3dpaint/hunyuanpaintpbr/pipeline.py
++++ b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+@@ -281,6 +281,9 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+             if isinstance(prompt, str):
+                 prompt = [prompt for _ in range(batch_size)]
+             device = self._execution_device
++            # Ensure text_encoder is on GPU (may have been offloaded)
++            if hasattr(self, "text_encoder") and self.text_encoder is not None:
++                self.text_encoder.to(device)
+             prompt_embeds, _ = self.encode_prompt(
+                 prompt, device=device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False
+             )
+diff --git a/hy3dpaint/textureGenPipeline.py b/hy3dpaint/textureGenPipeline.py
+index a582892..75a17a6 100644
+--- a/hy3dpaint/textureGenPipeline.py
++++ b/hy3dpaint/textureGenPipeline.py
+@@ -52,6 +52,7 @@ class Hunyuan3DPaintConfig:
+         self.resolution = resolution
+         self.bake_exp = 4
+         self.merge_method = "fast"
++        self.num_inference_steps = 15
+ 
+         # view selection
+         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
+@@ -92,6 +93,12 @@ class Hunyuan3DPaintPipeline:
+     @torch.no_grad()
+     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
+         """Generate texture for 3D mesh using multiview diffusion"""
++        import time as _time
++        _t0 = _time.time()
++        def _log(msg):
++            elapsed = _time.time() - _t0
++            print(f"  [{elapsed:6.1f}s] {msg}", flush=True)
++
+         # Ensure image_prompt is a list
+         if isinstance(image_path, str):
+             image_prompt = Image.open(image_path)
+@@ -106,6 +113,7 @@ class Hunyuan3DPaintPipeline:
+         path = os.path.dirname(mesh_path)
+         if use_remesh:
+             processed_mesh_path = os.path.join(path, "white_mesh_remesh.obj")
++            _log("Remeshing...")
+             remesh_mesh(mesh_path, processed_mesh_path)
+         else:
+             processed_mesh_path = mesh_path
+@@ -115,11 +123,14 @@ class Hunyuan3DPaintPipeline:
+             output_mesh_path = os.path.join(path, f"textured_mesh.obj")
+ 
+         # Load mesh
++        _log("UV unwrapping...")
+         mesh = trimesh.load(processed_mesh_path)
+         mesh = mesh_uv_wrap(mesh)
++        _log("Loading mesh into renderer...")
+         self.render.load_mesh(mesh=mesh)
+ 
+         ########### View Selection #########
++        _log("Selecting views...")
+         selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
+             self.config.candidate_camera_elevs,
+             self.config.candidate_camera_azims,
+@@ -127,9 +138,11 @@ class Hunyuan3DPaintPipeline:
+             self.config.max_selected_view_num,
+         )
+ 
++        _log("Rendering normal maps...")
+         normal_maps = self.view_processor.render_normal_multiview(
+             selected_camera_elevs, selected_camera_azims, use_abs_coor=True
+         )
++        _log("Rendering position maps...")
+         position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
+ 
+         ##########  Style  ###########
+@@ -145,24 +158,34 @@ class Hunyuan3DPaintPipeline:
+         image_style = [image.convert("RGB") for image in image_style]
+ 
+         ###########  Multiview  ##########
++        _log("Generating multiview PBR (this is the slow step)...")
+         multiviews_pbr = self.models["multiview_model"](
+             image_style,
+             normal_maps + position_maps,
+             prompt=image_caption,
+             custom_view_size=self.config.resolution,
+             resize_input=True,
++            num_inference_steps=self.config.num_inference_steps,
+         )
++        _log("Multiview generation complete.")
++
+         ###########  Enhance  ##########
++        _log("Enhancing textures with RealESRGAN...")
++        # Release denoising VRAM cache - prevents allocator fragmentation that
++        # would otherwise slow RealESRGAN from 0.3s/image to 80+s/image.
++        torch.cuda.empty_cache()
++
+         enhance_images = {}
+-        enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
+-        enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
++        enhance_images["albedo"] = list(multiviews_pbr["albedo"])
++        enhance_images["mr"] = list(multiviews_pbr["mr"])
+ 
+         for i in range(len(enhance_images["albedo"])):
+             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
+             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+ 
+         ###########  Bake  ##########
+-        for i in range(len(enhance_images)):
++        _log("Baking textures...")
++        for i in range(len(enhance_images["albedo"])):
+             enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
+                 (self.config.render_size, self.config.render_size)
+             )
+@@ -177,16 +200,25 @@ class Hunyuan3DPaintPipeline:
+         mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
+ 
+         ##########  inpaint  ###########
+-        texture = self.view_processor.texture_inpaint(texture, mask_np)
++        _log("Inpainting texture seams...")
++        from concurrent.futures import ThreadPoolExecutor
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            fut_albedo = pool.submit(self.view_processor.texture_inpaint, texture, mask_np)
++            fut_mr = pool.submit(self.view_processor.texture_inpaint, texture_mr, mask_mr_np) if "mr" in enhance_images else None
++            texture = fut_albedo.result()
++            if fut_mr is not None:
++                texture_mr = fut_mr.result()
+         self.render.set_texture(texture, force_set=True)
+         if "mr" in enhance_images:
+-            texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np)
+             self.render.set_texture_mr(texture_mr)
+ 
++        _log("Saving mesh...")
+         self.render.save_mesh(output_mesh_path, downsample=True)
+ 
+         if save_glb:
++            _log("Converting to GLB...")
+             convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
+             output_glb_path = output_mesh_path.replace(".obj", ".glb")
++        _log("Done!")
+ 
+         return output_mesh_path
+diff --git a/hy3dpaint/utils/multiview_utils.py b/hy3dpaint/utils/multiview_utils.py
+index 03f0557..b3984b0 100644
+--- a/hy3dpaint/utils/multiview_utils.py
++++ b/hy3dpaint/utils/multiview_utils.py
+@@ -64,13 +64,14 @@ class multiviewDiffusionNet:
+         os.environ["PL_GLOBAL_SEED"] = str(seed)
+ 
+     @torch.no_grad()
+-    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False):
++    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False, num_inference_steps=None):
+         pils = self.forward_one(
+-            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input
++            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input,
++            num_inference_steps=num_inference_steps,
+         )
+         return pils
+ 
+-    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False):
++    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False, num_inference_steps=None):
+         self.seed_everything(0)
+         custom_view_size = custom_view_size if custom_view_size is not None else self.pipeline.view_size
+         if not isinstance(input_images, List):
+@@ -98,8 +99,12 @@ class multiviewDiffusionNet:
+         kwargs["images_position"] = position_image
+ 
+         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
++            self.dino_v2.to(self.device)
+             dino_hidden_states = self.dino_v2(input_images[0])
+             kwargs["dino_hidden_states"] = dino_hidden_states
++            # Offload DINOv2 to CPU - it's done, frees ~2.2 GB VRAM
++            self.dino_v2.to("cpu")
++            torch.cuda.empty_cache()
+ 
+         sync_condition = None
+ 
+@@ -109,10 +114,12 @@ class multiviewDiffusionNet:
+             "DDIMScheduler": 50,
+             "ShiftSNRScheduler": 15,
+         }
++        if num_inference_steps is None:
++            num_inference_steps = infer_steps_dict[self.pipeline.scheduler.__class__.__name__]
+ 
+         mvd_image = self.pipeline(
+             input_images[0:1],
+-            num_inference_steps=infer_steps_dict[self.pipeline.scheduler.__class__.__name__],
++            num_inference_steps=num_inference_steps,
+             prompt=prompt,
+             sync_condition=sync_condition,
+             guidance_scale=3.0,
+diff --git a/hy3dpaint/utils/simplify_mesh_utils.py b/hy3dpaint/utils/simplify_mesh_utils.py
+index 7d3f10a..d9bf382 100644
+--- a/hy3dpaint/utils/simplify_mesh_utils.py
++++ b/hy3dpaint/utils/simplify_mesh_utils.py
+@@ -12,26 +12,22 @@
+ # fine-tuning enabling code and other elements of the foregoing made publicly available
+ # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
+ 
+-import trimesh
+ import pymeshlab
+ 
+ 
+-def remesh_mesh(mesh_path, remesh_path):
+-    mesh = mesh_simplify_trimesh(mesh_path, remesh_path)
++def remesh_mesh(mesh_path, remesh_path, target_count=40000):
++    """Load mesh, decimate to target face count, save as OBJ.
+ 
+-
+-def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
+-    # 先去除离散面
++    Uses pymeshlab's quadric edge collapse directly - avoids the old
++    pymeshlab->OBJ->trimesh->fast_simplification roundtrip.
++    """
+     ms = pymeshlab.MeshSet()
+-    if inputpath.endswith(".glb"):
+-        ms.load_new_mesh(inputpath, load_in_a_single_layer=True)
++    if mesh_path.endswith(".glb"):
++        ms.load_new_mesh(mesh_path, load_in_a_single_layer=True)
+     else:
+-        ms.load_new_mesh(inputpath)
+-    ms.save_current_mesh(outputpath.replace(".glb", ".obj"), save_textures=False)
+-    # 调用减面函数
+-    courent = trimesh.load(outputpath.replace(".glb", ".obj"), force="mesh")
+-    face_num = courent.faces.shape[0]
++        ms.load_new_mesh(mesh_path)
++
++    if ms.current_mesh().face_number() > target_count:
++        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target_count)
+ 
+-    if face_num > target_count:
+-        courent = courent.simplify_quadric_decimation(target_count)
+-    courent.export(outputpath)
++    ms.save_current_mesh(remesh_path, save_textures=False)

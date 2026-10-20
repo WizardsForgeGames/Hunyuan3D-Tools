@@ -1,0 +1,2 @@
+# Keep patches byte-exact (LF) so git apply works regardless of core.autocrlf
+*.patch -text
