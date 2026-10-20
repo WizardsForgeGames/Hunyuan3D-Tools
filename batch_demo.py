@@ -2,8 +2,8 @@
 Hunyuan3D-2.1 Full Pipeline Batch Demo
 Shape generation + optimized texture painting on RTX 4090.
 
-Runs shape gen and texture gen as separate processes to avoid import conflicts
-between hy3dshape and hy3dpaint modules.
+Runs shape gen and texture gen as two separate processes (one each, so each model
+loads once per batch) to avoid import conflicts between hy3dshape and hy3dpaint.
 
 Usage:
     python batch_demo.py                         # 10 default samples
@@ -41,38 +41,44 @@ DEFAULT_IMAGES = [
 ]
 
 
-def run_shape(image_path, output_mesh, steps=50):
-    """Run shape generation as a subprocess. Returns (time, success)."""
+def run_shape_batch(jobs, steps=50, seed=None):
+    """Generate all shapes in ONE subprocess, so the shape model loads once per batch.
+
+    jobs: [(image_path, output_mesh), ...]. Returns ({index: time or -1}, load_time).
+    Output is streamed as it arrives.
+    """
     cmd = [
         sys.executable, os.path.join(SCRIPT_DIR, "generate_shape.py"),
-        "--image", image_path,
-        "--output", output_mesh,
+        "--pairs", *[f"{img}|{out}" for img, out in jobs],
         "--steps", str(steps),
     ]
-    t0 = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    wall_time = time.time() - t0
-
-    # Print subprocess output
-    if result.stdout:
-        for line in result.stdout.strip().split("\n"):
-            if not line.startswith("SHAPE_TIME="):
-                print(f"    {line}")
-
-    if result.returncode != 0:
-        print(f"    ERROR: shape gen failed")
-        if result.stderr:
-            # Print last few lines of stderr
-            err_lines = result.stderr.strip().split("\n")
-            for line in err_lines[-5:]:
-                print(f"    ! {line}")
-        return wall_time, False
-
-    # Parse machine-readable time
-    match = re.search(r"SHAPE_TIME=([\d.]+)", result.stdout)
-    gen_time = float(match.group(1)) if match else wall_time
-
-    return gen_time, True
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
+    times = {}
+    load_time = None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1)
+    tail = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        m = re.match(r"SHAPE_TIME:(\d+)=([\d.]+|FAIL)$", line)
+        if m:
+            times[int(m.group(1))] = -1 if m.group(2) == "FAIL" else float(m.group(2))
+            continue
+        m = re.match(r"SHAPE_LOAD=([\d.]+)$", line)
+        if m:
+            load_time = float(m.group(1))
+            continue
+        tail = (tail + [line])[-5:]
+        print(f"    {line}", flush=True)
+    proc.wait()
+    if proc.returncode != 0 and len(times) < len(jobs):
+        print("    ERROR: shape gen failed")
+        for line in tail:
+            print(f"    ! {line}")
+    for i in range(len(jobs)):
+        times.setdefault(i, -1)
+    return times, load_time
 
 
 def run_texture(mesh_path, image_path, output_path, quantize_mode="tensorcore", compile_flag=False, texture_steps=15, max_retries=2):
@@ -138,6 +144,8 @@ def main():
                         help="Skip shape gen (use pre-existing meshes in output dir)")
     parser.add_argument("--shape-steps", type=int, default=50,
                         help="Shape diffusion steps (default: 50)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed each shape's initial noise (default: unseeded)")
     parser.add_argument("--texture-steps", type=int, default=15,
                         help="Texture denoising steps (default: 15, try 10 for speed)")
     args = parser.parse_args()
@@ -169,27 +177,31 @@ def main():
     names = []
 
     # ═══════════════════════════════════════════
-    #  Phase 1: Shape Generation (separate process per model)
+    #  Phase 1: Shape Generation (one process, model loaded once)
     # ═══════════════════════════════════════════
     mesh_paths = {}
+    t_batch = time.time()
+    shape_wall = texture_wall = None
     if not args.skip_shape:
-        print("--- PHASE 1: Shape Generation ---")
+        print("--- PHASE 1: Shape Generation (batch) ---")
         print()
-        for idx, img_path in enumerate(image_paths):
+        jobs = []
+        for img_path in image_paths:
             name = os.path.splitext(os.path.basename(img_path))[0]
             names.append(name)
             out_mesh = os.path.join(args.output_dir, f"{name}_mesh.glb")
             mesh_paths[name] = out_mesh
+            jobs.append((img_path, out_mesh))
 
-            print(f"  [{idx+1}/{n}] {name}")
-            t, ok = run_shape(img_path, out_mesh, steps=args.shape_steps)
-            if ok:
-                shape_times[name] = t
-                print(f"    -> {t:.1f}s")
-            else:
-                shape_times[name] = -1
-                print(f"    -> FAILED")
-            print()
+        t_phase = time.time()
+        times, shape_load = run_shape_batch(jobs, steps=args.shape_steps, seed=args.seed)
+        shape_wall = time.time() - t_phase
+        for idx, name in enumerate(names):
+            shape_times[name] = times[idx]
+            print(f"  {name}: " + (f"{times[idx]:.1f}s" if times[idx] > 0 else "FAILED"))
+        if shape_load is not None:
+            print(f"  (shape model load: {shape_load:.1f}s, once)")
+        print()
     else:
         for img_path in image_paths:
             name = os.path.splitext(os.path.basename(img_path))[0]
@@ -219,6 +231,7 @@ def main():
         img_path = image_paths[names.index(name)]
         batch_pairs.append(f"{mesh_path}|{img_path}")
 
+    t_phase = time.time()
     if batch_pairs:
         cmd = [
             sys.executable, os.path.join(SCRIPT_DIR, "texture_batch.py"),
@@ -264,6 +277,8 @@ def main():
             for line in err_lines[-10:]:
                 print(f"  ! {line}")
 
+    texture_wall = time.time() - t_phase
+
     # ═══════════════════════════════════════════
     #  Results
     # ═══════════════════════════════════════════
@@ -296,6 +311,10 @@ def main():
         print(f"  {'Average':<25s} {avg_s:>7.1f}s {avg_t:>7.1f}s {avg_s+avg_t:>7.1f}s")
 
     print()
+    if shape_wall is not None:
+        print(f"  Shape phase wall time:   {shape_wall:.1f}s")
+    print(f"  Texture phase wall time: {texture_wall:.1f}s")
+    print(f"  Total wall time:         {time.time() - t_batch:.1f}s")
     print(f"  Output: {args.output_dir}")
     succeeded = sum(1 for t in valid_texture if t > 0)
     print(f"  Completed: {succeeded}/{n}")
