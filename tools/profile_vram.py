@@ -23,7 +23,10 @@ if _cuda_path:
 
 sys.path.insert(0, os.path.join(REPO_DIR, "hy3dpaint"))
 sys.path.insert(0, REPO_DIR)
-sys.path.insert(0, os.path.join(REPO_DIR, "hy3dpaint", "custom_rasterizer"))
+# custom_rasterizer: prefer the copy pip-installed into this environment (built against its
+# torch); an in-place build in custom_rasterizer/ is only a fallback, since a .pyd built
+# for another torch version fails to load.
+sys.path.append(os.path.join(REPO_DIR, "hy3dpaint", "custom_rasterizer"))
 
 # Torchvision fix
 try:
