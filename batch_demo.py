@@ -22,6 +22,10 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
 
+# Run at High QoS so Windows keeps the CPU stages on the P-cores (see win_qos.py)
+from win_qos import request_high_qos
+request_high_qos()
+
 # Default showcase images - 10 varied subjects
 DEFAULT_IMAGES = [
     "assets/example_images/ainimal_9.png",

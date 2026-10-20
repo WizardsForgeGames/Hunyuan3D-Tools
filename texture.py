@@ -17,6 +17,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.join(SCRIPT_DIR, "Hunyuan3D-2.1")
 
+# Run at High QoS so Windows keeps the CPU stages on the P-cores (see win_qos.py)
+from win_qos import request_high_qos
+request_high_qos()
+
 # Add CUDA DLL directory for Windows (must happen before torch import)
 _cuda_path = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME", "")
 if _cuda_path:
